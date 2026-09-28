@@ -1,0 +1,60 @@
+name: REPD quarterly Quickbase update
+
+on:
+  schedule:
+    # 06:00 UTC on the 10th of Jan, Apr, Jul and Oct (after the REPD quarterly extract is posted)
+    - cron: "0 6 10 1,4,7,10 *"
+  workflow_dispatch:
+    inputs:
+      repd_file:
+        description: "OPTIONAL: REPD CSV committed to this repo, e.g. inputs/repd.csv (blank = latest from GOV.UK)"
+        required: false
+        default: ""
+      run_date:
+        description: "Present date for estimates, YYYY-MM-DD (blank = today)"
+        required: false
+        default: ""
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120          # OpenCage free tier = 1 request/second
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Unit tests
+        run: python -m pytest -q tests
+
+      - name: Build upload sheets
+        env:
+          QB_REALM: ${{ vars.QB_REALM || 'enerdatics.quickbase.com' }}
+          QB_TABLE_ID: ${{ vars.QB_TABLE_ID || 'bs8th2g3g' }}
+          QB_REPORT_ID: ${{ vars.QB_REPORT_ID || '1000638' }}
+          QB_USER_TOKEN: ${{ secrets.QB_USER_TOKEN }}
+          OPENCAGE_API_KEY: ${{ secrets.OPENCAGE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
+          GPT_MAX_CALLS: ${{ vars.GPT_MAX_CALLS || '800' }}
+          IN_FILE: ${{ inputs.repd_file }}
+          IN_DATE: ${{ inputs.run_date }}
+        run: |
+          args=(--out-dir outputs)
+          if [ -n "$IN_FILE" ]; then args+=(--repd-csv "$IN_FILE"); fi
+          if [ -n "$IN_DATE" ]; then args+=(--run-date "$IN_DATE"); fi
+          python -m repd_qb.main "${args[@]}"
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repd-qb-update-${{ github.run_number }}
+          path: outputs/
+          retention-days: 90

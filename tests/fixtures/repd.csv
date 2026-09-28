@@ -1,0 +1,9 @@
+Ref ID,Operator (or Applicant),Site Name,Technology Type,Storage Co-location REPD Ref ID,Installed Capacity (MWelec),CfD Allocation Round,CfD Capacity (MW),Development Status,Post Code,County,Region,Country,X-coordinate,Y-coordinate,Planning Application Submitted,Planning Permission  Granted,Appeal Granted,Under Construction,Operational,Solar Site Area (sqm)
+1001,Alpha Solar Ltd,Alpha Solar Farm,Solar Photovoltaics,,49.9,,,Planning Permission Granted,,Kent,South East,England,560000,150000,01/03/2024,15/06/2025,,,,400000
+1002,Beta Storage Ltd,Beta BESS,Battery,,100,,,Under Construction,,Norfolk,East of England,England,620000,310000,01/01/2023,01/06/2023,,01/02/2026,,
+1003,Gamma Wind Ltd,Gamma Wind Farm,Wind Onshore,,30,,,Operational,,Highland,Scotland,Scotland,260000,850000,01/01/2016,01/01/2017,,01/03/2018,01/05/2020,
+1004,Delta Energy Ltd,Delta Solar,Solar Photovoltaics,,60,,,Planning Application Submitted,,Devon,South West,England,280000,100000,01/07/2026,,,,,
+1005,Eps Ltd,Epsilon Solar,Solar Photovoltaics,,20,,,Abandoned,,Devon,South West,England,281000,101000,01/01/2020,,,,,
+1006,Zeta Ltd,Zeta Storage,Battery,,50,,,Planning Permission Granted,,Essex,East of England,England,580000,200000,01/01/2025,01/05/2026,,,,
+1007,Omega Offshore Ltd,Omega Offshore,Wind Offshore,,1000,AR6,900,Under Construction,,,,England,,,01/01/2022,01/01/2023,,01/01/2025,,
+1008,Hydro Co,Some Hydro,Small Hydro,,2,,,Operational,,Gwynedd,Wales,Wales,,,,,,,01/01/2015,

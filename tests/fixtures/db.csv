@@ -1,0 +1,9 @@
+Project ID,Project name,State data plant ID,Power Capacity (MW),Sector,Sub-sector,Project life cycle,Offshore/Onshore,Project investment status,Project investment ($M) - Estimated,Project investment ($M) - Reported,Operational date status,Operational date (estimated),Operational date (reported),Financial close date status,Financial close (estimated),Financial close date (reported),Site area (acres),Analyst comments,Show analyst comment,EIA approval received,Grid connection approved,Financing secured,Financing type,PPA signed,Power sales arrangement,Revenue mechanism,SPV,Show SPV,State/Region,Sub-location,Environmental approval date,Co-located storage,UK CFD Allocation Round (AR),Lead QC
+P-1,Alpha Solar Farm,1001,49.9,Solar,,Early-stage,,,,,,,,,,,,,,,,,,,,,,,Kent,Ashford,,,,false
+P-2,Beta BESS,1002,100,Battery,,Late-stage,,,,,,,,,,,,,,,,,,,,,,,,,,,,false
+P-3,Gamma Wind Farm,1003,30,Wind,,Operational,Onshore,,,,,,,,,,,,,,,,,,,,,,,,,,,false
+P-6,Zeta Storage,1006,45,Battery,,Early-stage,,,,,,,,,,,,"Other details:
+-- analyst note",,,,,,,,,,,,,,,,true
+P-9,Orphan,9999,10,Solar,,Early-stage,,,,,,,,,,,,,,,,,,,,,,,,,,,,false
+P-500,Delta Solar Farm,,58,Solar,,Early-stage,,,,,,,,,,,,,,,,,,,,,Delta Energy Ltd,,Devon,Exeter,,,,false
+P-501,Other Solar,,5,Solar,,Early-stage,,,,,,,,,,,,,,,,,,,,,,,Devon,,,,,false
