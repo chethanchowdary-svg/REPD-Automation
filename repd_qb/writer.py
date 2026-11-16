@@ -48,7 +48,7 @@ def sheet(wb, title, columns, rows, widths=None):
     return ws
 
 
-def write(path, upd: dict, new_rows, new_cols, id_matches, stats):
+def write(path, upd: dict, new_rows, new_cols, id_matches, stats, flags=None):
     cols = upd["columns"]
     wb = Workbook()
     wb.remove(wb.active)
@@ -60,6 +60,9 @@ def write(path, upd: dict, new_rows, new_cols, id_matches, stats):
     if id_matches:
         sheet(wb, "ID Matches (GPT)", list(id_matches[0].keys()), id_matches,
               widths={"Reason": 70, "REPD name": 32, "DB project name": 32})
+    if flags is not None:
+        from .validate import COLS as FLAG_COLS
+        sheet(wb, "QC Flags", FLAG_COLS, flags, widths={"Detail": 80, "Flag": 34, "Project name": 32})
     sheet(wb, "Full DB", cols, upd["full"])
     log = upd["log"]
     sheet(wb, "Change Log", list(log.columns) if len(log) else ["Project name", "State data plant ID",

@@ -11,6 +11,7 @@ import calendar
 import datetime as dt
 import re
 import time
+import unicodedata
 
 import pandas as pd
 import requests
@@ -22,14 +23,17 @@ PRESENT_DATE = dt.date.today()          # main.py can override for a given run
 OPENCAGE_MIN_INTERVAL_SEC = 1.05
 OPENCAGE_TIMEOUT_SEC = 30
 
-# ---- Date-estimate rates ----
+# ---- Date-estimate rates (house rules section 6) ----
+# Early-stage FC = present + MW/50 x 8 months (>= 6 months); Late-stage FC = present + MW/50 x 6
+# (>= 3 months); COD = FC + MW/50 x 6 (wind >= 6, others >= 3, <= 48 months); operational FC =
+# COD - MW/50 x 6 (<= 36 months back); in-construction FC = present - MW/50 x 6 (not after present).
 EARLY_MONTHS_PER_50      = 8
 LATE_MONTHS_PER_50       = 6
 OP_MONTHS_PER_50         = 6
-CONSTRUCTION_OP_PER_50   = 9
-EARLY_FC_FLOOR_MONTHS    = 15
-LATE_FC_FLOOR_MONTHS     = 13
-FC_EST_MAX_FROM_TODAY_MO = 24
+CONSTRUCTION_OP_PER_50   = 6
+EARLY_FC_FLOOR_MONTHS    = 6
+LATE_FC_FLOOR_MONTHS     = 3
+FC_EST_MAX_FROM_TODAY_MO = 24       # house cap for very large projects ("adjustable by size")
 OP_MIN_MONTHS_WIND       = 6
 OP_MIN_MONTHS_OTHER      = 3
 OP_MAX_MONTHS            = 48
@@ -43,8 +47,15 @@ METRIC_RANGES = {
     ("Solar",   "op"):  (1.10, 1.40),
     ("Battery", "any"): (1.00, 1.00),
 }
+# Allowed $M/MW per house rules section 7 (an existing estimate outside these is re-estimated).
+ALLOWED_METRIC = {
+    ("Solar", "dev"): (1.0, 1.2), ("Solar", "op"): (1.1, 1.4),
+    ("Wind", "dev"): (1.4, 1.6), ("Wind", "op"): (1.6, 1.8),
+    ("Battery", "dev"): (0.9, 1.6), ("Battery", "op"): (0.9, 1.6),
+}
+METRIC_TOLERANCE = 0.02
 INVESTMENT_BILLION_THRESHOLD = 1000.0
-MIN_ESTIMATED_INVESTMENT_M   = 1.01
+MIN_ESTIMATED_INVESTMENT_M   = 1.0
 
 SQM_PER_ACRE        = 4046.8564224
 OVERWRITE_SITE_AREA = True
@@ -90,7 +101,12 @@ C_SHOWSPV = "Show_SPV"
 C_REGION  = "State/Region"
 C_SUBLOC  = "Sub_location"
 
-REVMECH_MANAGED_VALUES = {"not applicable", "pending finalization", "undisclosed"}
+REVMECH_MANAGED_VALUES = {"not applicable", "pending finalization", "undisclosed",
+                          "yet to be determined/unavailable"}
+REVMECH_UNKNOWN = "Yet to be determined/Unavailable"     # SOP section 7: unknown battery mechanism
+PSA_UNKNOWN     = "Yet to be determined/Unavailable"
+PSA_BATTERY     = "Not Applicable"                       # house rules section 20 (capital A)
+PSA_CFD         = "Contracts-for-Difference"
 
 OFFSHORE_WIND_METRIC_MIN = 1.85
 OFFSHORE_WIND_METRIC_MAX = 2.90
@@ -245,11 +261,18 @@ def normalize_multiselect(v):
             if items is None:
                 items = s[1:-1].split(",")
         else:
-            return s
-    cleaned = [str(it).strip().strip("'\"").strip() for it in items if str(it).strip().strip("'\"").strip()]
-    if not cleaned:
-        return ""
-    return cleaned[0] if len(cleaned) == 1 else ";".join(cleaned)
+            items = s.split(";")
+    cleaned = []
+    for it in items:
+        t = str(it).strip().strip("'\"").strip()
+        if t and t not in cleaned:
+            cleaned.append(t)
+    return ";".join(cleaned)
+
+
+def multiselect_items(v):
+    s = normalize_multiselect(v)
+    return [t for t in s.split(";") if t] if s else []
 
 
 def parse_capacity(v):
@@ -359,21 +382,43 @@ def months_for_capacity(cap_mw, per_50):
 
 
 def estimate_fc_forward(anchor, cap_mw, per_50, floor_months):
-    cand = eom_add(anchor, months_for_capacity(cap_mw, per_50))
+    """Early/Late-stage FC: present + MW/50 x rate, never below the floor (anchor kept for callers)."""
+    cand = eom_add(PRESENT_DATE, months_for_capacity(cap_mw, per_50))
     floor = eom_add(PRESENT_DATE, floor_months)
     cap_hi = eom_add(PRESENT_DATE, FC_EST_MAX_FROM_TODAY_MO)
     return min(max(cand, floor), cap_hi)
 
 
+def last_month_end_on_or_before(d):
+    e = end_of_month(d)
+    return e if e <= d else end_of_month(add_months(dt.date(d.year, d.month, 1), -1))
+
+
+def estimate_fc_construction(cap_mw):
+    """In construction, FC missing: present - MW/50 x 6 months, month-end, not later than present."""
+    cand = eom_add(PRESENT_DATE, -months_for_capacity(cap_mw, OP_MONTHS_PER_50))
+    return min(cand, last_month_end_on_or_before(PRESENT_DATE))
+
+
+def min_build_months(sector):
+    return OP_MIN_MONTHS_WIND if sector == "Wind" else OP_MIN_MONTHS_OTHER
+
+
 def estimate_op_from_fc(fc, cap_mw, sector, per_50=OP_MONTHS_PER_50):
     cand = eom_add(fc, months_for_capacity(cap_mw, per_50))
-    min_mo = OP_MIN_MONTHS_WIND if sector == "Wind" else OP_MIN_MONTHS_OTHER
-    return min(max(cand, eom_add(fc, min_mo)), eom_add(fc, OP_MAX_MONTHS))
+    return min(max(cand, eom_add(fc, min_build_months(sector))), eom_add(fc, OP_MAX_MONTHS))
 
 
-def backdate_fc_from_op(op, cap_mw):
-    months = min(months_for_capacity(cap_mw, OP_MONTHS_PER_50), FC_BACKDATE_MAX_MONTHS)
+def backdate_fc_from_op(op, cap_mw, sector=""):
+    """Operational, FC missing: COD - MW/50 x 6 months, at least the minimum build time
+    (wind 6, others 3) and at most 36 months back; month-end."""
+    months = months_for_capacity(cap_mw, OP_MONTHS_PER_50)
+    months = min(max(months, min_build_months(sector)), FC_BACKDATE_MAX_MONTHS)
     return eom_add(op, -months)
+
+
+def months_between(a, b):
+    return (b.year * 12 + b.month) - (a.year * 12 + a.month)
 
 
 def metric_for(sector, stage, cap_mw):
@@ -383,6 +428,25 @@ def metric_for(sector, stage, cap_mw):
         return None
     lo, hi = rng
     return round((lo + hi) / 2.0, 2)
+
+
+def metric_allowed(sector, offon, bucket, inv_m, cap_mw):
+    """True when inv/MW is inside the house-rule range (offshore wind has no house range: always OK)."""
+    if inv_m is None or not cap_mw:
+        return False
+    if sector == "Wind" and (offon or "").strip().lower() == "offshore":
+        return True
+    stage = "op" if bucket == BUCKET_OPERATIONAL else "dev"
+    rng = ALLOWED_METRIC.get((sector, stage))
+    if rng is None:
+        return True
+    m = inv_m / cap_mw
+    return rng[0] - METRIC_TOLERANCE <= m <= rng[1] + METRIC_TOLERANCE
+
+
+def round_investment(sector, inv):
+    """House rules section 7: nearest $1M; BESS keeps one decimal."""
+    return round(inv, 1) if sector == BATTERY_SECTOR else float(round(inv))
 
 
 def offshore_wind_metric(cap_mw, stage):
@@ -414,72 +478,79 @@ def compute_investment(sector, bucket, cap_mw, offon=""):
         metric = metric_for(sector, stage, cap_mw)
         if metric is None:
             return None, None
-    inv = round(metric * cap_mw, 2)
+    inv = round_investment(sector, metric * cap_mw)
     return max(inv, MIN_ESTIMATED_INVESTMENT_M), metric
 
 
 # =============================================================================
-# Analyst comment builder
+# Analyst comment builder (house rules section 8 templates)
 # =============================================================================
 def sector_phrase(sector, offon):
     if sector == "Wind":
-        oo = (offon or "").strip().lower()
-        return "offshore wind" if oo == "offshore" else "onshore wind" if oo == "onshore" else "wind"
+        return "offshore wind" if (offon or "").strip().lower() == "offshore" else "onshore wind"
+    if sector == BATTERY_SECTOR:
+        return "battery"
     return sector.lower()
 
 
+def _num(v):
+    return f"{v:,.1f}".rstrip("0").rstrip(".") if abs(v - round(v)) > 1e-9 else f"{v:,.0f}"
+
+
 def money_phrase_for_comment(inv_m):
-    if inv_m is None:
-        return ""
-    return (f"${inv_m / 1000.0:,.2f} billion" if inv_m >= INVESTMENT_BILLION_THRESHOLD
-            else f"${inv_m:,.2f} million")
+    return "" if inv_m is None else f"${_num(inv_m)} million"
 
 
 def investment_column_value_millions(inv_m):
     return round(float(inv_m), 2) if inv_m is not None else ""
 
 
+def investment_section(sector_txt, inv_m, cap_mw):
+    metric = round(inv_m / cap_mw, 2)
+    return ("Estimated Project Investment:\n"
+            f"-- Enerdatics calculates the project's investment to be {money_phrase_for_comment(inv_m)}, "
+            f"representing an investment metric of ${metric:g} million/MW.\n"
+            f"-- This estimate is in line with reported figures for {sector_txt} "
+            "projects of this scale and size in the region.")
+
+
+def timeline_section(sector_txt, fc_date, fc_estimated, op_date, op_estimated, is_operational):
+    basis = (f"-- This estimate is based on reported development timelines for {sector_txt} "
+             "projects of this scale and size in the region.")
+    if is_operational and fc_estimated and op_date:                         # Case 3
+        return ("Estimated Development Timeline:\n"
+                f"-- The project reached commercial operations in {fmt_month_year(op_date)}.\n"
+                "-- Further, Enerdatics believes that developer would have secured financing to fund "
+                f"construction activities on the project by {fmt_month_year(fc_date)}.\n" + basis)
+    if is_operational:
+        return ""
+    if op_estimated and fc_estimated:                                       # Case 4
+        return ("Estimated Development Timeline:\n"
+                f"-- The project is estimated to be commercially operational by {fmt_month_year(op_date)}.\n"
+                "-- Further, Enerdatics believes that the developer will have secured financing to fund "
+                f"construction activities on the project by {fmt_month_year(fc_date)}.\n" + basis)
+    if op_estimated and not fc_estimated:                                   # Case 2
+        return ("Estimated Development Timeline:\n"
+                f"-- The project is estimated to be commercially operational by {fmt_month_year(op_date)}.\n"
+                + basis + "\n"
+                "-- Further, the developer will secure financing to fund construction activities "
+                f"on the project by {fmt_month_year(fc_date)}.")
+    if fc_estimated and not op_estimated and op_date:                       # Case 5
+        return ("Estimated development timeline:\n"
+                f"-- The project is expected to be commercially operational by {fmt_month_year(op_date)}.\n"
+                "-- Further, Enerdatics believes that the developer will have secured financing to fund "
+                f"construction activities on the project by {fmt_month_year(fc_date)}.\n" + basis)
+    return ""
+
+
 def build_comment(sector_txt, inv_estimated, inv_m, cap_mw,
                   fc_date, fc_estimated, op_date, op_estimated, is_operational):
     blocks = []
     if inv_estimated and inv_m is not None and cap_mw and cap_mw > 0:
-        blocks.append(
-            "Estimated Project Investment:\n"
-            f"-- Enerdatics calculates the project's investment to be {money_phrase_for_comment(inv_m)}, "
-            f"representing an investment metric of ${inv_m / cap_mw:.2f} million/MW.\n"
-            f"-- This estimate is in line with reported figures for {sector_txt} "
-            "projects of this scale and size in the region."
-        )
-    timeline = None
-    if op_estimated and fc_estimated:
-        timeline = (
-            "Estimated Development Timeline:\n"
-            f"-- The project is estimated to be commercially operational by {fmt_month_year(op_date)}.\n"
-            "-- Further, Enerdatics believes that the developer will have secured financing to fund "
-            f"construction activities on the project by {fmt_month_year(fc_date)}.\n"
-            f"-- This estimate is based on reported development timelines for {sector_txt} "
-            "projects of this scale and size in the region."
-        )
-    elif op_estimated and not fc_estimated and not is_operational:
-        timeline = (
-            "Estimated Development Timeline:\n"
-            f"-- The project is estimated to be commercially operational by {fmt_month_year(op_date)}.\n"
-            f"-- This estimate is based on reported development timelines for {sector_txt} "
-            "projects of this scale and size in the region.\n"
-            "-- Further, The developer will secure financing to fund construction activities "
-            f"on the project by {fmt_month_year(fc_date)}."
-        )
-    elif is_operational and fc_estimated:
-        timeline = (
-            "Estimated Development Timeline:\n"
-            f"-- The project reached commercial operations in {fmt_month_year(op_date)}.\n"
-            "-- Further, Enerdatics believes that developer would have secured financing to fund "
-            f"construction activities on the project by {fmt_month_year(fc_date)}.\n"
-            f"-- This estimate is based on reported development timelines for {sector_txt} "
-            "projects of this scale and size in the region."
-        )
-    if timeline:
-        blocks.append(timeline)
+        blocks.append(investment_section(sector_txt, inv_m, cap_mw))
+    tl = timeline_section(sector_txt, fc_date, fc_estimated, op_date, op_estimated, is_operational)
+    if tl:
+        blocks.append(tl)
     return "\n\n".join(blocks)
 
 
@@ -611,47 +682,77 @@ def _set_logged(row, col, val, changes, label=None):
         changes.append(f"{label or col}: '{old}' -> '{val}'")
 
 
-def apply_lifecycle_flags(row, work_bucket, changes, sector=""):
-    eia, grid, fin = LIFECYCLE_FLAGS.get(work_bucket, ("", "", ""))
-    psa = normalize_multiselect(row.get(C_PSA) or "").strip()
-    cfd_round = normalize_multiselect(row.get(C_CFDAR) or "").strip()
-    is_cfd = bool(cfd_round) or psa == "Contracts-for-Difference"
-    ppa = "Yes - Complete" if (work_bucket == BUCKET_OPERATIONAL or is_cfd) else "No"
+FIN_DEFAULT_BUCKETS = (BUCKET_CONSTR, BUCKET_OPERATIONAL, BUCKET_DECOMM)
 
-    _set_logged(row, C_EIA, eia, changes)
-    _set_logged(row, C_GRID, grid, changes)
-    _set_logged(row, C_FIN, fin, changes)
-    _set_logged(row, C_PPA, ppa, changes)
-    _set_logged(row, C_FINTYPE, "Debt; Equity" if fin == "Yes - Complete" else "", changes)
 
-    if cfd_round:
-        _set_logged(row, C_PSA, "Contracts-for-Difference", changes)
-        return
+def apply_lifecycle_flags(row, work_bucket, changes, sector="", repd_bucket=None):
+    """SOP section 6 matrix. Fixed defaults are applied only where the SOP fixes them; researched
+    values (Late-stage / Ready-to-build approvals and financing, PPA before operation) are kept."""
+    cfd_round = normalize_multiselect(row.get(C_CFDAR) or "")
+    cur = {c: (row.get(c) or "").strip() for c in (C_EIA, C_GRID, C_FIN, C_PPA)}
+    label = (row.get(C_LIFE) or "").strip().lower()
 
+    if work_bucket in FIN_DEFAULT_BUCKETS:
+        _set_logged(row, C_EIA, "Yes", changes)
+        _set_logged(row, C_GRID, "Yes", changes)
+        _set_logged(row, C_FIN, "Yes - Complete", changes)
+    elif work_bucket == BUCKET_EARLY:
+        _set_logged(row, C_EIA, "No", changes)
+        _set_logged(row, C_GRID, "No", changes)
+        _set_logged(row, C_FIN, "No", changes)
+    elif work_bucket == BUCKET_LATE:
+        for c in (C_EIA, C_GRID):
+            if cur[c] not in ("Yes", "No"):
+                _set_logged(row, c, "No", changes)
+        if cur[C_FIN] not in ("Yes - Complete", "Yes - Partial", "No"):
+            _set_logged(row, C_FIN, "No", changes)
+        # REPD planning permission granted = environmental approval obtained
+        if repd_bucket in (BUCKET_LATE, BUCKET_CONSTR, BUCKET_OPERATIONAL) and row.get(C_EIA) != "Yes":
+            _set_logged(row, C_EIA, "Yes", changes, label="EIA_approval_received (REPD permission granted)")
+        if label == "late-stage" and row.get(C_EIA) == "No" and row.get(C_GRID) == "No":
+            # house rules section 10: no approval evidence -> Early-stage
+            _set_logged(row, C_LIFE, "Early-stage", changes,
+                        label="life cycle (HR10: Late-stage without EIA or grid approval)")
+            _set_logged(row, C_FIN, "No", changes)
+            work_bucket = BUCKET_EARLY
+
+    # PPA signed: Yes - Complete for Operational or a CfD award; otherwise researched (blank -> No)
+    if work_bucket == BUCKET_OPERATIONAL or cfd_round:
+        _set_logged(row, C_PPA, "Yes - Complete", changes)
+    elif not cur[C_PPA]:
+        _set_logged(row, C_PPA, "No", changes)
+
+    # Financing type (SOP section 7): Debt + Equity from construction on, other instruments kept
+    ft = multiselect_items(row.get(C_FINTYPE))
+    if work_bucket in FIN_DEFAULT_BUCKETS:
+        ft = ["Debt", "Equity"] + [t for t in ft if t not in ("Debt", "Equity", "Undisclosed")]
+    elif (row.get(C_FIN) or "") == "No":
+        ft = [t for t in ft if t in ("Pending finalization", "Financing planned/under negotiation")]
+    _set_logged(row, C_FINTYPE, ";".join(ft), changes)
+
+    apply_commercial_fields(row, sector, changes)
+    return work_bucket
+
+
+def apply_commercial_fields(row, sector, changes):
+    """Power sales arrangement / Revenue mechanism (SOP section 7, house rules section 20)."""
+    cfd_round = normalize_multiselect(row.get(C_CFDAR) or "")
+    psa = multiselect_items(row.get(C_PSA))
     if sector == BATTERY_SECTOR:
-        _set_logged(row, C_PSA, "Not applicable", changes)
-        existing = (row.get(C_REVMECH) or "").strip()
-        if existing == "" or existing.lower() in REVMECH_MANAGED_VALUES:
-            if work_bucket in (BUCKET_CANCELLED, BUCKET_DECOMM):
-                target = "Not applicable"
-            elif work_bucket == BUCKET_OPERATIONAL:
-                target = "Undisclosed"
-            elif work_bucket in (BUCKET_EARLY, BUCKET_LATE, BUCKET_CONSTR):
-                target = "Pending finalization"
-            else:
-                target = existing
-            if target != existing:
-                _set_logged(row, C_REVMECH, target, changes)
+        _set_logged(row, C_PSA, PSA_BATTERY, changes)
+        rm = multiselect_items(row.get(C_REVMECH))
+        rm = [t for t in rm if t.lower() not in REVMECH_MANAGED_VALUES]
+        _set_logged(row, C_REVMECH, ";".join(rm) or REVMECH_UNKNOWN, changes)
         return
-
-    if (row.get(C_REVMECH) or "").strip():
-        existing = (row.get(C_REVMECH) or "").strip()
-        if existing.lower() in REVMECH_MANAGED_VALUES:
-            _set_logged(row, C_REVMECH, "", changes, label="Revenue_mechanism cleared (non-Battery)")
-
-    if sector in ("Solar", "Wind") and _blank(psa):
-        if (row.get(C_PPA) or "").strip() == "Yes - Complete":
-            _set_logged(row, C_PSA, "Yet to be determined/Unavailable", changes)
+    rm = multiselect_items(row.get(C_REVMECH))
+    if rm:
+        _set_logged(row, C_REVMECH, "", changes, label="Revenue_mechanism cleared (battery-only field)")
+    psa = [t for t in psa if t.lower() != "not applicable"]
+    if cfd_round and PSA_CFD not in psa:
+        psa = [PSA_CFD] + [t for t in psa if t != PSA_UNKNOWN]
+    if len(psa) > 1 and PSA_UNKNOWN in psa:
+        psa = [t for t in psa if t != PSA_UNKNOWN]
+    _set_logged(row, C_PSA, ";".join(psa) or PSA_UNKNOWN, changes)
 
 
 def apply_show_spv(row, rrow, changes):
@@ -714,14 +815,16 @@ def validate_and_fix_dates(row, cap, sector, work_bucket, rrow, changes):
         row[C_FC_REP] = ""
         row[C_FC_EST] = ""
         row[C_FC_ST] = ST_NONE
-        anch = parse_repd_date(rrow.get(R_SUBMIT)) or PRESENT_DATE
+        anch = PRESENT_DATE
         if work_bucket == BUCKET_EARLY:
             new_fc = estimate_fc_forward(anch, cap, EARLY_MONTHS_PER_50, EARLY_FC_FLOOR_MONTHS)
-        elif work_bucket in (BUCKET_LATE, BUCKET_CONSTR):
+        elif work_bucket == BUCKET_LATE:
             new_fc = estimate_fc_forward(anch, cap, LATE_MONTHS_PER_50, LATE_FC_FLOOR_MONTHS)
+        elif work_bucket == BUCKET_CONSTR:
+            new_fc = estimate_fc_construction(cap)
         elif work_bucket == BUCKET_OPERATIONAL:
             op = parse_db_date(row.get(C_OP_REP)) or parse_db_date(row.get(C_OP_EST))
-            new_fc = backdate_fc_from_op(op, cap) if op else None
+            new_fc = backdate_fc_from_op(op, cap, sector) if op else None
         else:
             new_fc = None
         if new_fc:
@@ -752,13 +855,11 @@ def validate_and_fix_dates(row, cap, sector, work_bucket, rrow, changes):
     if work_bucket in (BUCKET_OPERATIONAL, BUCKET_CONSTR):
         fc_date, fc_rep, op_date, op_rep = _read()
         if fc_date and fc_date > PRESENT_DATE:
-            op_anchor = parse_db_date(row.get(C_OP_REP)) or parse_db_date(row.get(C_OP_EST))
-            if op_anchor:
-                new_fc = backdate_fc_from_op(op_anchor, cap)
-                if new_fc >= PRESENT_DATE:
-                    new_fc = eom_add(PRESENT_DATE, -1)
+            op_anchor = parse_db_date(row.get(C_OP_REP))
+            if work_bucket == BUCKET_OPERATIONAL and op_anchor:
+                new_fc = min(backdate_fc_from_op(op_anchor, cap, sector), last_month_end_on_or_before(PRESENT_DATE))
             else:
-                new_fc = eom_add(PRESENT_DATE, -1)
+                new_fc = estimate_fc_construction(cap)
             row[C_FC_REP] = ""
             row[C_FC_EST] = fmt_db_date(new_fc)
             row[C_FC_ST] = ST_ESTIMATED
@@ -789,12 +890,12 @@ def validate_and_fix_dates(row, cap, sector, work_bucket, rrow, changes):
 
     # Ordering checks EIA <= FC <= OP (reported OP of an operational project is locked)
     fc_date, fc_rep, op_date, op_rep = _read()
-    op_locked = (work_bucket == BUCKET_OPERATIONAL and op_rep and op_date is not None)
+    op_locked = bool(op_rep and op_date is not None)
 
-    if eia_date and fc_date and eia_date > fc_date:
+    if eia_date and fc_date and eia_date > fc_date and not fc_rep:
         new_fc = eom_add(eia_date, 1)
         if op_locked and new_fc >= op_date:
-            new_fc = eom_add(op_date, -max(3, int(round(months_for_capacity(cap, OP_MONTHS_PER_50)))))
+            new_fc = eom_add(op_date, -min_build_months(sector))
         row[C_FC_REP] = ""
         row[C_FC_EST] = fmt_db_date(new_fc)
         row[C_FC_ST] = ST_ESTIMATED
@@ -802,45 +903,40 @@ def validate_and_fix_dates(row, cap, sector, work_bucket, rrow, changes):
                        f"FC moved to {fmt_db_date(new_fc)}")
         fc_date = new_fc
 
+    # FC -> OP gap: only an ESTIMATED date is moved; two reported dates are never touched.
     fc_date, fc_rep, op_date, op_rep = _read()
-    if fc_date and op_date and fc_date > op_date:
-        if op_locked:
-            new_fc = eom_add(op_date, -max(3, int(round(months_for_capacity(cap, OP_MONTHS_PER_50)))))
-            row[C_FC_REP] = ""
-            row[C_FC_EST] = fmt_db_date(new_fc)
-            row[C_FC_ST] = ST_ESTIMATED
-            changes.append(f"DATE CHECK: FC ({fmt_db_date(fc_date)}) > reported OP "
-                           f"({fmt_db_date(op_date)}), FC backdated to {fmt_db_date(new_fc)}")
-        else:
-            if work_bucket == BUCKET_CONSTR:
-                new_op = estimate_op_from_fc(fc_date, cap, sector, per_50=CONSTRUCTION_OP_PER_50)
-            else:
-                new_op = estimate_op_from_fc(fc_date, cap, sector)
-            if new_op is None or new_op <= fc_date:
-                new_op = eom_add(fc_date, 6)
-            row[C_OP_REP] = ""
-            row[C_OP_EST] = fmt_db_date(new_op)
-            row[C_OP_ST] = ST_ESTIMATED
-            changes.append(f"DATE CHECK: FC ({fmt_db_date(fc_date)}) > OP ({fmt_db_date(op_date)}), "
-                           f"OP pushed to {fmt_db_date(new_op)}")
-
-    # Minimum FC -> OP gap
-    fc_date, fc_rep, op_date, op_rep = _read()
-    if fc_date and op_date:
-        min_gap = min(max(3, int(round(months_for_capacity(cap, OP_MONTHS_PER_50)))), OP_MAX_MONTHS)
-        if (op_date.year * 12 + op_date.month) - (fc_date.year * 12 + fc_date.month) < min_gap:
-            if op_locked:
-                new_fc = eom_add(op_date, -min_gap)
-                row[C_FC_REP] = ""
-                row[C_FC_EST] = fmt_db_date(new_fc)
-                row[C_FC_ST] = ST_ESTIMATED
-                changes.append(f"DATE CHECK: FC->OP gap < {min_gap}mo, FC backdated to {fmt_db_date(new_fc)}")
-            else:
-                required_op = eom_add(fc_date, min_gap)
-                row[C_OP_REP] = ""
-                row[C_OP_EST] = fmt_db_date(required_op)
-                row[C_OP_ST] = ST_ESTIMATED
-                changes.append(f"DATE CHECK: FC->OP gap < {min_gap}mo, OP pushed to {fmt_db_date(required_op)}")
+    if fc_date and op_date and not (fc_rep and op_rep):
+        gap = months_between(fc_date, op_date)
+        floor = min_build_months(sector)
+        pre_constr = work_bucket in (BUCKET_EARLY, BUCKET_LATE)
+        if op_rep and pre_constr and fc_date <= PRESENT_DATE:
+            # not yet built: FC cannot be in the past; Late-stage floor from present, COD kept
+            new_fc = eom_add(PRESENT_DATE, EARLY_FC_FLOOR_MONTHS if work_bucket == BUCKET_EARLY
+                             else LATE_FC_FLOOR_MONTHS)
+            latest = eom_add(op_date, -floor)          # must still leave the minimum build time
+            if new_fc > latest:
+                new_fc = latest if latest > PRESENT_DATE else eom_add(PRESENT_DATE, 1)
+            row[C_FC_REP], row[C_FC_EST], row[C_FC_ST] = "", fmt_db_date(new_fc), ST_ESTIMATED
+            changes.append(f"DATE CHECK: estimated FC {fmt_db_date(fc_date)} in the past for a "
+                           f"pre-construction project, moved to {fmt_db_date(new_fc)}")
+        elif op_rep and not pre_constr:
+            # reported COD, estimated FC: FC = COD - MW/50 x 6 within [floor, 36] months before COD
+            if gap < floor or gap > FC_BACKDATE_MAX_MONTHS:
+                want = min(max(months_for_capacity(cap, OP_MONTHS_PER_50), floor), FC_BACKDATE_MAX_MONTHS)
+                new_fc = eom_add(op_date, -want)
+                if work_bucket in (BUCKET_OPERATIONAL, BUCKET_CONSTR):
+                    new_fc = min(new_fc, last_month_end_on_or_before(PRESENT_DATE))
+                row[C_FC_REP], row[C_FC_EST], row[C_FC_ST] = "", fmt_db_date(new_fc), ST_ESTIMATED
+                changes.append(f"DATE CHECK: FC->reported OP gap {gap}mo outside {floor}-"
+                               f"{FC_BACKDATE_MAX_MONTHS}mo, FC re-estimated {fmt_db_date(new_fc)}")
+        elif gap < floor or gap > OP_MAX_MONTHS:
+            # estimated COD: FC + MW/50 x 6 within [floor, 48] months
+            new_op = estimate_op_from_fc(fc_date, cap, sector)
+            if work_bucket != BUCKET_OPERATIONAL and new_op <= PRESENT_DATE:
+                new_op = eom_add(PRESENT_DATE, CONSTR_MIN_FUTURE_OP_MO if work_bucket == BUCKET_CONSTR else 1)
+            row[C_OP_REP], row[C_OP_EST], row[C_OP_ST] = "", fmt_db_date(new_op), ST_ESTIMATED
+            changes.append(f"DATE CHECK: FC->OP gap {gap}mo outside {floor}-{OP_MAX_MONTHS}mo, "
+                           f"OP re-estimated {fmt_db_date(new_op)}")
 
     # Blank-date check
     for st_col, est_col, rep_col in ((C_FC_ST, C_FC_EST, C_FC_REP), (C_OP_ST, C_OP_EST, C_OP_REP)):
@@ -882,14 +978,13 @@ def rebuild_comment_from_row(row, sector, offon, cap):
 
 
 def _clear_psa_if_ppa_no(row, sector, changes):
-    if sector != BATTERY_SECTOR:
-        cfd_r = normalize_multiselect(row.get(C_CFDAR) or "").strip()
-        if not cfd_r and (row.get(C_PPA) or "").strip() == "No" and (row.get(C_PSA) or "").strip():
-            _set_logged(row, C_PSA, "", changes, label="PSA cleared (PPA=No)")
+    """Kept for callers. PSA is no longer cleared when PPA signed = No: an unknown arrangement is
+    'Yet to be determined/Unavailable' (SOP section 7), set by apply_commercial_fields."""
+    apply_commercial_fields(row, sector, changes)
 
 
 # =============================================================================
-# Core per-row processor (unchanged rules)
+# Core per-row processor
 # =============================================================================
 def match_repd_id(join_raw, repd_idx):
     for tok in re.split(r"[;,]|\bOR\b|/", join_raw):
@@ -899,7 +994,9 @@ def match_repd_id(join_raw, repd_idx):
     return join_raw if join_raw in repd_idx else None
 
 
-def process_row(row, repd_idx, log):
+def process_row(row, repd_idx, log, keep_lifecycle=False):
+    """keep_lifecycle=True (Lead QC rows where REPD would move the lifecycle down): the DB
+    lifecycle is kept, but every other rule still runs."""
     changes, tracked_cols = [], set()
     name = row.get(C_NAME, "")
     join_raw = "" if _blank(row.get(C_JOIN)) else str(row.get(C_JOIN)).strip()
@@ -959,7 +1056,7 @@ def process_row(row, repd_idx, log):
     # 1. lifecycle
     repd_status = (rrow.get(R_STATUS) or "").strip().lower()
     bucket = REPD_STATUS_TO_BUCKET.get(repd_status)
-    if bucket is not None:
+    if bucket is not None and not keep_lifecycle:
         new_label, old_label = BUCKET_TO_DB_LABEL[bucket], (row.get(C_LIFE) or "").strip()
         if new_label != old_label:
             row[C_LIFE] = new_label
@@ -969,20 +1066,35 @@ def process_row(row, repd_idx, log):
     work_bucket = DB_LABEL_TO_BUCKET.get(cur_label, bucket)
 
     # 1b. lifecycle flags + Show SPV
+    # 1a. house rules section 10: a reported financial close that has passed -> In construction
+    fc_rep_now = parse_db_date(row.get(C_FC_REP)) or parse_repd_date(rrow.get(R_UCONST))
+    if (work_bucket in (BUCKET_EARLY, BUCKET_LATE) and fc_rep_now and fc_rep_now <= PRESENT_DATE
+            and (row.get(C_FC_ST) or "").strip() == ST_REPORTED):
+        _set_logged(row, C_LIFE, "In construction", changes,
+                    label=f"life cycle (HR10: reported FC {fmt_db_date(fc_rep_now)} has passed)")
+        tracked_cols.add(C_LIFE)
+        work_bucket = BUCKET_CONSTR
+
+    # 1b. lifecycle flags + Show SPV
     psa_before = (row.get(C_PSA) or "").strip()
-    apply_lifecycle_flags(row, work_bucket, changes, sector=sector)
+    life_before = (row.get(C_LIFE) or "").strip()
+    work_bucket = apply_lifecycle_flags(row, work_bucket, changes, sector=sector, repd_bucket=bucket)
+    if (row.get(C_LIFE) or "").strip() != life_before:
+        tracked_cols.add(C_LIFE)
     if (row.get(C_PSA) or "").strip() != psa_before:
         tracked_cols.add(C_PSA)
     apply_show_spv(row, rrow, changes)
 
-    # 2. terminal: wipe
+    # 2. terminal. Cancelled/Suspended: statuses 'Not reported', no dates, no comment (HR5).
+    # Decommissioned is a distinct stage (SOP section 9): its data is kept, not wiped or estimated.
+    if work_bucket == BUCKET_DECOMM:
+        log.append({"Project name": name, "State data plant ID": rid,
+                    "Action": "UPDATED (decommissioned)" if changes else "no change",
+                    "Detail": " | ".join(changes)})
+        return row, bool(changes), tracked_cols
     if work_bucket in TERMINAL_BUCKETS:
         clear_estimates_and_dates(row, changes,
                                   "terminal lifecycle -> cleared estimates, status set to 'Not reported'")
-        if sector != BATTERY_SECTOR:
-            cfd_r = normalize_multiselect(row.get(C_CFDAR) or "").strip()
-            if not cfd_r and (row.get(C_PSA) or "").strip():
-                _set_logged(row, C_PSA, "", changes, label="PSA cleared (terminal)")
         if changes:
             log.append({"Project name": name, "State data plant ID": rid,
                         "Action": "UPDATED (terminal)", "Detail": " | ".join(changes)})
@@ -1048,15 +1160,13 @@ def process_row(row, repd_idx, log):
     fc_date, fc_estimated = fc_reported, (fc_status != ST_REPORTED)
     if fc_status != ST_REPORTED:
         if work_bucket == BUCKET_OPERATIONAL and op_reported:
-            fc_date = backdate_fc_from_op(op_reported, cap)
+            fc_date = backdate_fc_from_op(op_reported, cap, sector)
         elif work_bucket == BUCKET_CONSTR:
-            fc_date = estimate_fc_forward(PRESENT_DATE, cap, LATE_MONTHS_PER_50, LATE_FC_FLOOR_MONTHS)
+            fc_date = estimate_fc_construction(cap)
         elif work_bucket == BUCKET_EARLY:
-            anchor = parse_repd_date(rrow.get(R_SUBMIT)) or PRESENT_DATE
-            fc_date = estimate_fc_forward(anchor, cap, EARLY_MONTHS_PER_50, EARLY_FC_FLOOR_MONTHS)
+            fc_date = estimate_fc_forward(PRESENT_DATE, cap, EARLY_MONTHS_PER_50, EARLY_FC_FLOOR_MONTHS)
         elif work_bucket == BUCKET_LATE:
-            anchor = parse_repd_date(rrow.get(R_SUBMIT)) or PRESENT_DATE
-            fc_date = estimate_fc_forward(anchor, cap, LATE_MONTHS_PER_50, LATE_FC_FLOOR_MONTHS)
+            fc_date = estimate_fc_forward(PRESENT_DATE, cap, LATE_MONTHS_PER_50, LATE_FC_FLOOR_MONTHS)
         if fc_date:
             row[C_FC_EST], row[C_FC_REP], row[C_FC_ST] = fmt_db_date(fc_date), "", ST_ESTIMATED
             fc_estimated = True
@@ -1066,19 +1176,10 @@ def process_row(row, repd_idx, log):
     op_date, op_estimated = op_reported, (op_status != ST_REPORTED)
     if op_status != ST_REPORTED and work_bucket != BUCKET_OPERATIONAL:
         if work_bucket == BUCKET_CONSTR:
-            base_fc = fc_date or estimate_fc_forward(PRESENT_DATE, cap, LATE_MONTHS_PER_50, LATE_FC_FLOOR_MONTHS)
-            cand = estimate_op_from_fc(base_fc, cap, sector, per_50=CONSTRUCTION_OP_PER_50)
+            base_fc = fc_date or estimate_fc_construction(cap)
+            cand = estimate_op_from_fc(base_fc, cap, sector)
             min_fut = eom_add(PRESENT_DATE, CONSTR_MIN_FUTURE_OP_MO)
-            if cand < min_fut:
-                back = min(12, max(3, round(months_for_capacity(cap, 3))))
-                base_fc = eom_add(PRESENT_DATE, -back)
-                cand = estimate_op_from_fc(base_fc, cap, sector, per_50=CONSTRUCTION_OP_PER_50)
-                if cand < min_fut:
-                    cand = min_fut
-                if fc_status != ST_REPORTED:
-                    row[C_FC_EST], row[C_FC_ST] = fmt_db_date(base_fc), ST_ESTIMATED
-                    fc_date, fc_estimated = base_fc, True
-            op_date = cand
+            op_date = max(cand, min_fut)
         elif fc_date and work_bucket in (BUCKET_EARLY, BUCKET_LATE, BUCKET_CONSTR):
             op_date = estimate_op_from_fc(fc_date, cap, sector)
         if op_date and work_bucket != BUCKET_OPERATIONAL:
@@ -1086,18 +1187,7 @@ def process_row(row, repd_idx, log):
             op_estimated = True
             changes.append(f"OP estimated from FC: {fmt_db_date(op_date)}")
 
-    # 5b. PSA rules based on PPA signed (except battery)
-    if sector != BATTERY_SECTOR:
-        current_ppa = (row.get(C_PPA) or "").strip()
-        current_psa = (row.get(C_PSA) or "").strip()
-        cfd_round_check = normalize_multiselect(row.get(C_CFDAR) or "").strip()
-        if current_ppa == "No" and current_psa and not cfd_round_check:
-            _set_logged(row, C_PSA, "", changes, label="Power_sales_arrangement cleared (PPA signed = No)")
-            tracked_cols.add(C_PSA)
-        elif current_ppa == "Yes - Complete" and not current_psa and not cfd_round_check:
-            _set_logged(row, C_PSA, "Yet to be determined/Unavailable", changes,
-                        label="Power_sales_arrangement set (PPA=Yes-Complete, PSA was blank)")
-            tracked_cols.add(C_PSA)
+    # 5b. PSA / revenue mechanism (already set in 1b; PSA is no longer cleared when PPA = No)
 
     # 6. date ordering checks
     validate_and_fix_dates(row, cap, sector, work_bucket, rrow, changes)
@@ -1173,53 +1263,188 @@ _TL_RE = re.compile(r"(?im)^[^\w\r\n]*e?stimated[ \t]+development[ \t]+timeline[
                     r"(?=(\r?\n[ \t]*\r?\n)|\Z)", re.S)
 
 
+_SECTION_HEAD = re.compile(r"^[^\w\r\n]*e?stimated[ \t]+(project[ \t]+investment|development[ \t]+timeline)"
+                           r"[ \t]*:", re.I)
+
+
+def _paragraphs(text):
+    return [p for p in re.split(r"\r?\n[ \t]*\r?\n", (text or "").strip()) if p.strip()]
+
+
+def _section_kind(par):
+    m = _SECTION_HEAD.match(par.strip())
+    return None if not m else ("inv" if "investment" in m.group(1).lower() else "tl")
+
+
 def timeline_paragraph(comment: str) -> str:
-    m = _TL_RE.search(comment or "")
-    return m.group(0).strip() if m else ""
+    for p in _paragraphs(comment):
+        if _section_kind(p) == "tl":
+            return p.strip()
+    return ""
+
+
+def merge_generated_sections(existing: str, inv_sec: str, tl_sec: str) -> str:
+    """QC rows: the 'Estimated Project Investment' and 'Estimated Development Timeline' paragraphs
+    are replaced in place (or removed when nothing is estimated); every other analyst paragraph is
+    kept as written. A missing section is added: investment before the timeline."""
+    pars = _paragraphs(existing)
+    new = {"inv": (inv_sec or "").strip(), "tl": (tl_sec or "").strip()}
+    out, placed = [], set()
+    for p in pars:
+        k = _section_kind(p)
+        if k is None:
+            out.append(p.strip())
+        elif k not in placed:
+            placed.add(k)
+            if new[k]:
+                out.append(new[k])
+    if new["inv"] and "inv" not in placed:
+        idx = next((i for i, p in enumerate(out) if p == new["tl"]), len(out))
+        out.insert(idx, new["inv"])
+    if new["tl"] and "tl" not in placed:
+        out.append(new["tl"])
+    return "\n\n".join(out)
 
 
 def replace_timeline_in_place(existing: str, tl_sec: str) -> str:
-    """QC rows: swap only the timeline paragraph; every other character stays as it was."""
-    text = existing or ""
-    nl = "\r\n" if "\r\n" in text else "\n"
-    new = (tl_sec or "").replace("\r\n", "\n").replace("\n", nl)
-    m = _TL_RE.search(text)
-    if m:
-        out = text[:m.start()] + new + text[m.end():]
-        return re.sub(r"(\r?\n[ \t]*){3,}", nl + nl, out).strip() if not new else out
-    if not new:
-        return text
-    return (text.rstrip() + nl + nl + new) if text.strip() else new
+    inv = next((p for p in _paragraphs(existing) if _section_kind(p) == "inv"), "")
+    return merge_generated_sections(existing, inv, tl_sec)
 
 
 def qc_process(row: dict, repd_idx: dict, log: list) -> dict:
-    """Lead QC rows: REPD capacity applied; lifecycle only moves UP; investment untouched;
-    only the 'Estimated Development Timeline' paragraph of the analyst comment is replaced."""
+    """Lead QC rows: the DB capacity is never changed (a REPD difference is only logged); lifecycle
+    only moves UP (a REPD downgrade keeps the DB lifecycle, but every other rule still runs); a valid
+    estimated or reported investment is kept; the generated comment sections are rebuilt."""
     original = dict(row)
     rid = match_repd_id(_cmp(row.get(C_JOIN)), repd_idx)
+    keep = False
     if rid:
-        repd_cap = parse_capacity(repd_idx[rid].get(R_CAP))
-        db_cap = parse_capacity(row.get(C_CAP))
+        rr = repd_idx[rid]
+        repd_cap, db_cap = parse_capacity(rr.get(R_CAP)), parse_capacity(row.get(C_CAP))
         if repd_cap is not None and (db_cap is None or abs(repd_cap - db_cap) > 0.01):
-            row[C_CAP] = f"{repd_cap:g}"
-        bucket = REPD_STATUS_TO_BUCKET.get((repd_idx[rid].get(R_STATUS) or "").strip().lower())
+            log.append({"Project name": row.get(C_NAME, ""), "State data plant ID": rid,
+                        "Action": "QC: capacity not changed",
+                        "Detail": f"REPD capacity {repd_cap:g} MW vs DB {row.get(C_CAP, '')} MW (Lead QC)"})
+        bucket = REPD_STATUS_TO_BUCKET.get((rr.get(R_STATUS) or "").strip().lower())
         new_label = BUCKET_TO_DB_LABEL.get(bucket, "")
         cur = (original.get(C_LIFE) or "").strip()
-        if new_label and new_label.lower() != cur.lower() and \
-                LIFECYCLE_RANK.get(new_label.lower(), -1) <= LIFECYCLE_RANK.get(cur.lower(), -1):
+        if new_label and new_label.lower() != cur.lower() and                 LIFECYCLE_RANK.get(new_label.lower(), -1) <= LIFECYCLE_RANK.get(cur.lower(), -1):
+            keep = True
             log.append({"Project name": row.get(C_NAME, ""), "State data plant ID": rid,
                         "Action": "QC: lifecycle downgrade not applied",
-                        "Detail": f"REPD points to {cur} -> {new_label}; only capacity synced"})
-            return row
-    new_row, _c, tracked = process_row(dict(row), repd_idx, log)
+                        "Detail": f"REPD points to {cur} -> {new_label}; DB lifecycle kept"})
+    new_row, _c, tracked = process_row(dict(row), repd_idx, log, keep_lifecycle=keep)
     if "__NO_MATCH__" in tracked:
         return original
-    for f in (C_INV_ST, C_INV_EST, C_INV_REP):
-        if f in original:
-            new_row[f] = original[f]
-    comment = replace_timeline_in_place(original.get(C_COMMENT, ""), timeline_paragraph(new_row.get(C_COMMENT, "")))
-    new_row[C_COMMENT], new_row[C_SHOWCOM] = comment, ("Yes" if comment.strip() else "No")
+    new_row[C_CAP] = original.get(C_CAP, "")
+    cap = parse_capacity(new_row.get(C_CAP))
+    sector = (new_row.get(C_SECTOR) or "").strip()
+    offon = new_row.get(C_OFFON)
+
+    # investment: keep the QC'd value unless it breaks a rule
+    o_st = (original.get(C_INV_ST) or "").strip()
+    o_est, o_rep = parse_money(original.get(C_INV_EST)), parse_money(original.get(C_INV_REP))
+    bucket_now = DB_LABEL_TO_BUCKET.get((new_row.get(C_LIFE) or "").strip().lower())
+    terminal = bucket_now in TERMINAL_BUCKETS
+    if not terminal and o_rep is not None and o_st in (ST_REPORTED, ST_ESTIMATED):
+        new_row[C_INV_ST], new_row[C_INV_REP], new_row[C_INV_EST] = ST_REPORTED, original.get(C_INV_REP), ""
+    elif (not terminal and o_st == ST_ESTIMATED and o_est is not None
+          and metric_allowed(sector, offon, bucket_now, o_est, cap)):
+        new_row[C_INV_ST], new_row[C_INV_EST], new_row[C_INV_REP] = ST_ESTIMATED, original.get(C_INV_EST), ""
+    # otherwise process_row's estimate (or terminal wipe) stands
+
+    if terminal:
+        new_row[C_COMMENT] = ""
+    elif sector != HYDRO_SECTOR:
+        st = lambda c: (new_row.get(c) or "").strip() == ST_ESTIMATED
+        inv_m = parse_money(new_row.get(C_INV_EST))
+        sect = sector_phrase(sector, offon)
+        inv_sec = investment_section(sect, inv_m, cap) if st(C_INV_ST) and inv_m and cap else ""
+        fc_d = parse_db_date(new_row.get(C_FC_EST)) or parse_db_date(new_row.get(C_FC_REP))
+        op_d = parse_db_date(new_row.get(C_OP_EST)) or parse_db_date(new_row.get(C_OP_REP))
+        is_op = bucket_now == BUCKET_OPERATIONAL
+        tl_sec = timeline_section(sect, fc_d, st(C_FC_ST), op_d, st(C_OP_ST), is_op)
+        new_row[C_COMMENT] = merge_generated_sections(original.get(C_COMMENT, ""), inv_sec, tl_sec)
     return new_row
+
+
+# =============================================================================
+# Final pass on every output row (house rules 2, 6, 8, 14, 20)
+# =============================================================================
+_PLAIN_MAP = str.maketrans({"‘": "'", "’": "'", "‚": "'", "‛": "'",
+                            "“": '"', "”": '"', "–": "-", "—": "-",
+                            "−": "-", " ": " ", "…": "...", "ß": "ss",
+                            "ø": "o", "Ø": "O", "æ": "ae", "Æ": "AE",
+                            "ł": "l", "Ł": "L", "đ": "d", "Đ": "D",
+                            "þ": "th", "ð": "d", "œ": "oe", "Œ": "OE"})
+_BOOL_COLS = (C_SHOWSPV, C_SHOWCOM)
+MULTISELECT_COLS = (C_PSA, C_CFDAR, C_REVMECH, C_FINTYPE)
+_TRUE_WORDS = {"true", "yes", "1", "y"}
+_BATTERY_NAME_RE = re.compile(r"BESS|Battery|Energy Storage", re.I)
+
+
+_CP1252_RUN = re.compile("[\u0080-ÿŒœŠšŸŽžƒˆ˜"
+                         "–—‘-„†-•…‰‹›€™]{2,}")
+
+
+def fix_mojibake(v):
+    """UTF-8 text that was read as cp1252 (once or twice), e.g. 'â€™' or 'Ã¢â‚¬â„¢' -> '’'."""
+    def _one(m):
+        s = m.group(0)
+        for _ in range(3):
+            try:
+                t = s.encode("cp1252").decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                break
+            if t == s:
+                break
+            s = t
+        return s
+    return _CP1252_RUN.sub(_one, v)
+
+
+def plain_letters(v):
+    """House rules 14: accented/special letters -> plain letters (U+FFFD is left for the QC flags)."""
+    if not isinstance(v, str) or v.isascii():
+        return v
+    # double-encoded replacement character already stored in Quickbase -> one marker (QC Flags)
+    v = fix_mojibake(v.replace("ï¿½", "�"))
+    s = unicodedata.normalize("NFD", v.translate(_PLAIN_MAP))      # letters only; symbols such as £ kept
+    return unicodedata.normalize("NFC", "".join(ch for ch in s if not unicodedata.combining(ch)))
+
+
+def finalize_row(row: dict) -> dict:
+    sector = (row.get(C_SECTOR) or "").strip()
+    for c, v in list(row.items()):
+        if not str(c).startswith("_") and isinstance(v, str):
+            row[c] = plain_letters(v)
+    for col in (C_PSA, C_CFDAR, C_REVMECH, C_FINTYPE):
+        if col in row:
+            row[col] = normalize_multiselect(row[col])
+    if sector in (BATTERY_SECTOR, "Solar", "Wind"):
+        apply_commercial_fields(row, sector, [])
+    for col in _BOOL_COLS:
+        if col in row and not _blank(row.get(col)):
+            row[col] = "Yes" if str(row[col]).strip().lower() in _TRUE_WORDS else "No"
+    if sector == BATTERY_SECTOR and row.get(C_NAME) and not _BATTERY_NAME_RE.search(row[C_NAME]):
+        row[C_NAME] = row[C_NAME].rstrip() + " BESS"
+    # status <-> value consistency; a reported value always wins over an old estimate
+    for st, est, rep in ((C_INV_ST, C_INV_EST, C_INV_REP), (C_FC_ST, C_FC_EST, C_FC_REP),
+                         (C_OP_ST, C_OP_EST, C_OP_REP)):
+        s_ = (row.get(st) or "").strip()
+        if s_ == ST_REPORTED and not _blank(row.get(rep)):
+            row[est] = ""
+        elif s_ == ST_ESTIMATED and not _blank(row.get(est)):
+            row[rep] = ""
+        elif s_ == ST_ESTIMATED and not _blank(row.get(rep)):
+            row[st] = ST_REPORTED
+    for col in (C_FC_EST, C_OP_EST):
+        d = parse_db_date(row.get(col))
+        if d and d != end_of_month(d):
+            row[col] = fmt_db_date(end_of_month(d))
+    any_est = any((row.get(c) or "").strip() == ST_ESTIMATED for c in (C_INV_ST, C_FC_ST, C_OP_ST))
+    row[C_SHOWCOM] = "Yes" if (any_est and not _blank(row.get(C_COMMENT))) else "No"
+    return row
 
 
 def is_lead_qc(v) -> bool:
@@ -1256,13 +1481,14 @@ def run_update(db: pd.DataFrame, repd: pd.DataFrame, qc_extra: pd.DataFrame | No
             new_row, _changed, tracked = process_row(dict(row), repd_idx, log)
             if "__NO_MATCH__" in tracked and source != "gpt":
                 return
-        for col in (C_PSA, C_CFDAR, C_REVMECH):
-            if col in new_row:
-                new_row[col] = normalize_multiselect(new_row[col])
-        if C_COMMENT in new_row and _blank(new_row.get(C_COMMENT)):
-            new_row[C_SHOWCOM] = "No"
-        changed_cols = {c for c in set(original) | set(new_row)
-                        if not str(c).startswith("_") and _cmp(original.get(c)) != _cmp(new_row.get(c))}
+        new_row = finalize_row(new_row)
+
+        def same(c):
+            a, b = _cmp(original.get(c)), _cmp(new_row.get(c))
+            if c in MULTISELECT_COLS:          # "Debt; Equity" == "Debt;Equity" == "['Debt', 'Equity']"
+                return set(multiselect_items(a)) == set(multiselect_items(b))
+            return a == b
+        changed_cols = {c for c in set(original) | set(new_row) if not str(c).startswith("_") and not same(c)}
         if source == "gpt":
             changed_cols.add(C_JOIN)          # Ref ID added by the GPT / manual match
         new_row["_changed"] = changed_cols

@@ -37,10 +37,29 @@ Schedule: 06:00 UTC on 10 Jan / Apr / Jul / Oct. Edit the `cron` line to change 
 
 ## Lead QC rows
 
-- REPD capacity is applied (the old sheet only reported it).
-- Lifecycle only moves **up** (a downgrade is logged, not applied).
-- Investment fields are not re-estimated.
-- Only the "Estimated Development Timeline" paragraph of the analyst comment is replaced.
+- Capacity is **never changed**; a REPD difference is listed in QC Flags / Change Log only.
+- Lifecycle only moves **up**. On a REPD downgrade the DB lifecycle is kept, but every other rule
+  still runs (dates, flags, formats, comment).
+- A reported investment, or an estimate inside the house-rule $/MW range, is kept; an estimate outside
+  the range (or "Not reported" on a live project) is re-estimated.
+- Only the "Estimated Project Investment" and "Estimated Development Timeline" paragraphs of the analyst
+  comment are rebuilt (or removed when nothing is estimated); other analyst paragraphs are kept.
+
+## House rules applied (Projects-Entry-Bot house_rules.md + SOP.md)
+
+| Area | Rule |
+|---|---|
+| Dates (HR6) | Early FC = today + MW/50x8 (>= 6 mo); Late FC = today + MW/50x6 (>= 3 mo); In-construction FC = today - MW/50x6 (not after today); COD = FC + MW/50x6 (wind >= 6, others >= 3, <= 48 mo); operational FC = COD - MW/50x6 (<= 36 mo); estimates at month-end; reported dates are never overwritten by the gap checks |
+| Lifecycle (HR10, SOP 6) | reported FC passed on a pre-construction row -> In construction; Late-stage with EIA = No and Grid = No -> Early-stage; Late / Ready-to-build approvals, financing and PPA are kept (researched), defaults only where the SOP fixes them |
+| Investment (HR7) | nearest $1M (BESS 1 decimal); comment metric = value / MW |
+| Comments (HR8) | template cases 2-5, "onshore/offshore wind", Show analyst comment = Yes only when something is estimated |
+| Battery (HR2, HR20) | name gets " BESS"; Power sales arrangement = Not Applicable; Revenue mechanism defaults to Yet to be determined/Unavailable (New Projects now has the column) |
+| Commercial (SOP 7) | blank PSA -> Yet to be determined/Unavailable (no longer cleared when PPA = No); CfD round adds CfD to the PSA list; Financing type Debt + Equity from construction on, other instruments kept |
+| Formats (HR14) | Yes/No instead of True/False; multi-selects as `A;B`; mojibake repaired, accents -> plain letters |
+
+**QC Flags tab**: what the rules cannot decide (duplicate REPD IDs / names, CfD capacity > project
+capacity, broken characters, operational without a reported COD, COD > 4 years after a reported FC,
+REPD capacity differences on Lead QC rows, ...).
 
 ## GPT matching (new REPD projects vs DB projects without a Ref ID)
 

@@ -30,7 +30,7 @@ def test_full_run(tmp_path, monkeypatch):
 
     qc = pd.read_excel(x, "Lead QC Update", dtype=str).fillna("")
     z = qc[qc["Project ID"] == "P-6"].iloc[0]
-    assert z["Project_life_cycle"] == "Late-stage" and z["Power_Capacity_(MW)"] == "50"
+    assert z["Project_life_cycle"] == "Late-stage" and z["Power_Capacity_(MW)"] == "45"   # Lead QC: capacity never changed
     assert "P-6" not in set(pd.read_excel(x, "Lifecycle Capacity", dtype=str)["Project ID"])
 
     other = pd.concat([pd.read_excel(x, s, dtype=str) for s in ("Lifecycle Capacity", "Other Changes")]).fillna("")
@@ -52,10 +52,77 @@ def test_qc_keeps_analyst_text_and_blocks_downgrade():
            "Project_investment_($M)___Reported": "70",
            "Analyst_comments": "Other details:\n-- keep me\n\nEstimated Development Timeline:\n-- old"}
     out = updater.qc_process(dict(row), idx, log)
-    assert out["Project_life_cycle"] == "Late-stage" and out["Power_Capacity_(MW)"] == "50"
+    assert out["Project_life_cycle"] == "Late-stage" and out["Power_Capacity_(MW)"] == "45"
     assert out["Analyst_comments"].startswith("Other details:\n-- keep me\n\nEstimated Development Timeline:")
     assert "-- old" not in out["Analyst_comments"]
     assert out["Project_investment_($M)___Reported"] == "70"
     down = dict(row, **{"Project_life_cycle": "Operational"})
     out2 = updater.qc_process(down, idx, log)
-    assert out2["Project_life_cycle"] == "Operational" and out2["Power_Capacity_(MW)"] == "50"
+    assert out2["Project_life_cycle"] == "Operational" and out2["Power_Capacity_(MW)"] == "45"
+
+
+# ---- house rules (Projects-Entry-Bot house_rules.md) ----
+def _qc_row(**kw):
+    base = {"Project ID": "Q-1", "Project_name": "Test", "State_data_plant_ID": "1006", "Lead QC": "true",
+            "Power_Capacity_(MW)": "45", "Sector": "Solar", "Offshore/Onshore": "Onshore",
+            "Project_life_cycle": "Late-stage"}
+    base.update(kw)
+    return base
+
+
+def _run_qc(row):
+    from repd_qb import updater
+    import datetime as dt
+    updater.PRESENT_DATE = dt.date(2026, 11, 16)
+    repd = pd.read_csv(FX / "repd.csv", dtype=str, keep_default_na=False)
+    idx = {r["Ref ID"]: r for _, r in repd.iterrows()}
+    return updater.finalize_row(updater.qc_process(dict(row), idx, []))
+
+
+def test_battery_psa_name_and_revenue_mechanism():
+    out = _run_qc(_qc_row(Sector="Battery", Project_name="Saticoy", Power_sales_arrangement="Not applicable"))
+    assert out["Power_sales_arrangement"] == "Not Applicable"                 # HR20
+    assert out["Project_name"] == "Saticoy BESS"                              # HR2
+    assert out["Revenue_mechanism"] == "Yet to be determined/Unavailable"     # SOP 7
+
+
+def test_formats_and_plain_letters():
+    out = _run_qc(_qc_row(Show_SPV="True", SPV="Pr\u00f6sen \u2013 Gr\u00f6ditz",
+                          Financing_type="['Debt', 'Equity']"))
+    assert out["Show_SPV"] == "Yes" and out["SPV"] == "Prosen - Groditz"
+    assert out["Show_analyst_comment"] in ("Yes", "No")
+
+
+def test_reported_investment_clears_stale_estimate_and_comment():
+    out = _run_qc(_qc_row(**{"Project_investment_status": "Reported", "Project_investment_($M)___Reported": "70",
+                             "Project_investment_($M)___Estimated": "50",
+                             "Analyst_comments": "Estimated Project Investment:\n-- old\n\nOther:\n-- keep"}))
+    assert out["Project_investment_($M)___Estimated"] == ""
+    assert "Estimated Project Investment" not in out["Analyst_comments"]
+    assert "Other:\n-- keep" in out["Analyst_comments"]
+
+
+def test_out_of_range_estimate_is_re_estimated_and_comment_matches():
+    out = _run_qc(_qc_row(**{"Project_investment_status": "Estimated", "Project_investment_($M)___Estimated": "130"}))
+    inv = float(out["Project_investment_($M)___Estimated"])
+    assert 1.0 <= inv / 45 <= 1.2                                             # HR7 solar range
+    assert f"${inv:,.0f} million" in out["Analyst_comments"]
+
+
+def test_estimated_dates_are_month_end_and_fc_not_in_past():
+    import datetime as dt
+    from repd_qb import updater
+    out = _run_qc(_qc_row(Project_life_cycle="Ready-to-build", EIA_approval_received="Yes",
+                          Grid_connection_approved="Yes", Financing_secured="Yes - Partial",
+                          **{"Financial_close_date_status": "Estimated", "Financial_close_(estimated)": "08/30/2026"}))
+    fc = updater.parse_db_date(out["Financial_close_(estimated)"])
+    assert fc > dt.date(2026, 11, 16) and fc == updater.end_of_month(fc)
+    assert out["Project_life_cycle"] == "Ready-to-build"                      # REPD downgrade not applied
+
+
+def test_mojibake_repaired_then_plain():
+    from repd_qb.updater import plain_letters
+    assert plain_letters("Crown Estate\u00e2\u20ac\u2122s") == "Crown Estate's"
+    assert plain_letters("UK\u00c3\u00a2\u00e2\u201a\u00ac\u00e2\u201e\u00a2s") == "UK's"
+    assert plain_letters("\u00a313.2 billion") == "\u00a313.2 billion"
+    assert plain_letters("Orkney\u00ef\u00bf\u00bds") == "Orkney\ufffds"          # left for QC Flags

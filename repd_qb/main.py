@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 from . import config as C
-from . import id_matcher, new_projects, sources, updater, writer
+from . import id_matcher, new_projects, sources, updater, validate, writer
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -85,8 +85,10 @@ def main(argv=None) -> int:
         "New projects": len(new_rows),
         **stats,
     }
+    flags = validate.build(upd, new_rows, run_date)
+    stats["QC flags (analyst to check)"] = len(flags)
     path = out / f"REPD_QB_Update_{run_date:%Y%m%d}.xlsx"
-    writer.write(path, upd, new_rows, new_projects.OUT_COLS, id_rows, stats)
+    writer.write(path, upd, new_rows, new_projects.OUT_COLS, id_rows, stats, flags)
     for k, v in stats.items():
         print(f"  {k}: {v}")
     print(f"Output: {path}")

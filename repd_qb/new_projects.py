@@ -175,6 +175,7 @@ C_TERR    = "Territory_(UK)"
 C_CFDCAP  = "UK_CFD_Allocated_Capacity_(MW)"
 C_CFDAR   = "UK_CFD_Allocation_Round_(AR)"
 C_OFFON   = "Offshore/Onshore"
+C_REVMECH = "Revenue_mechanism"
 
 OUT_COLS = [
     C_PID, C_SDPID, C_NAME, C_CAP, C_SECTOR, C_LIFE, C_REGION, C_COUNTRY,
@@ -183,7 +184,7 @@ OUT_COLS = [
     C_OP_EST, C_OP_REP, C_OP_ST, C_PSA, C_PPA,
     C_INV_EST, C_INV_REP, C_INV_ST, C_SHOWCOM, C_SHOWSPV, C_VIEWER,
     C_AREA, C_SOLAR, C_SPV, C_SUBLOC, C_LAT, C_LON, C_SUBSECT, C_TERR,
-    C_CFDCAP, C_CFDAR,
+    C_CFDCAP, C_CFDAR, C_REVMECH,
 ]
 
 
@@ -346,6 +347,12 @@ def build_comment(sect, inv_est, inv_m, metric, fc, fc_est, op, op_est, is_op):
     if timeline:
         blocks.append(timeline)
     return "\n\n".join(blocks)
+
+
+# House-rule estimation and comment logic is shared with the updater (one source of truth).
+from .updater import (estimate_fc_forward, estimate_fc_construction, estimate_op_from_fc,  # noqa: E402
+                      backdate_fc_from_op, sector_phrase, finalize_row)
+from . import updater as _U  # noqa: E402
 
 
 # =============================================================================
@@ -587,7 +594,7 @@ def build_row(rrow, repd_idx, loc_cache=None):
     row[C_LIFE] = BUCKET_TO_DB_LABEL[bucket]
     eia, grid, fin = LIFECYCLE_FLAGS.get(bucket, ("", "", ""))
     row[C_EIA], row[C_GRID], row[C_FIN] = eia, grid, fin
-    row[C_FINTYPE] = "Debt; Equity" if fin == "Yes - Complete" else ""
+    row[C_FINTYPE] = "Debt;Equity" if fin == "Yes - Complete" else ""
     if ar:
         row[C_PSA] = "Contracts-for-Difference"
     row[C_PPA] = ("Yes - Complete" if (bucket == BUCKET_OPERATIONAL or row[C_PSA] == "Contracts-for-Difference")
@@ -628,55 +635,41 @@ def build_row(rrow, repd_idx, loc_cache=None):
         row[C_SHOWCOM] = "No"
         return row, bucket
 
-    fc_date, fc_estimated = repd_fc, (fc_status != ST_REPORTED)
+    fc_date, fc_estimated = repd_fc, False
     if fc_status != ST_REPORTED:
         if bucket == BUCKET_OPERATIONAL and repd_op:
-            fc_date = backdate_fc_from_op(repd_op, cap)
+            fc_date = backdate_fc_from_op(repd_op, cap, sector)
         elif bucket == BUCKET_CONSTR:
-            fc_date = estimate_fc_forward(PRESENT_DATE, cap, LATE_MONTHS_PER_50, LATE_FC_FLOOR_MONTHS)
+            fc_date = estimate_fc_construction(cap)
         elif bucket == BUCKET_EARLY:
-            anchor = parse_repd_date(rrow.get(R_SUBMIT)) or PRESENT_DATE
-            fc_date = estimate_fc_forward(anchor, cap, EARLY_MONTHS_PER_50, EARLY_FC_FLOOR_MONTHS)
+            fc_date = estimate_fc_forward(PRESENT_DATE, cap, EARLY_MONTHS_PER_50, _U.EARLY_FC_FLOOR_MONTHS)
         elif bucket == BUCKET_LATE:
-            anchor = parse_repd_date(rrow.get(R_SUBMIT)) or PRESENT_DATE
-            fc_date = estimate_fc_forward(anchor, cap, LATE_MONTHS_PER_50, LATE_FC_FLOOR_MONTHS)
+            fc_date = estimate_fc_forward(PRESENT_DATE, cap, LATE_MONTHS_PER_50, _U.LATE_FC_FLOOR_MONTHS)
         if fc_date:
             row[C_FC_EST], row[C_FC_ST], fc_estimated = fmt_db_date(fc_date), ST_ESTIMATED, True
 
-    op_date, op_estimated = repd_op, (op_status != ST_REPORTED)
+    op_date, op_estimated = repd_op, False
     if op_status != ST_REPORTED:
-        if bucket == BUCKET_CONSTR:
-            base_fc = fc_date or estimate_fc_forward(PRESENT_DATE, cap, LATE_MONTHS_PER_50, LATE_FC_FLOOR_MONTHS)
-            cand = estimate_op_from_fc(base_fc, cap, sector, p50=CONSTRUCTION_OP_PER_50)
-            min_fut = eom_add(PRESENT_DATE, CONSTR_MIN_FUTURE_OP_MO)
-            if cand < min_fut:
-                back = min(12, max(3, round(months_for_capacity(cap, 3))))
-                base_fc = eom_add(PRESENT_DATE, -back)
-                cand = estimate_op_from_fc(base_fc, cap, sector, p50=CONSTRUCTION_OP_PER_50)
-                if cand < min_fut:
-                    cand = min_fut
-                if fc_status != ST_REPORTED:
-                    row[C_FC_EST], row[C_FC_ST] = fmt_db_date(base_fc), ST_ESTIMATED
-                    fc_date, fc_estimated = base_fc, True
-            op_date = cand
-        elif fc_date:
-            op_date = estimate_op_from_fc(fc_date, cap, sector)
-        if op_date and bucket != BUCKET_OPERATIONAL:
-            row[C_OP_EST], row[C_OP_ST], op_estimated = fmt_db_date(op_date), ST_ESTIMATED, True
-        elif bucket == BUCKET_OPERATIONAL and not repd_op:
+        if bucket == BUCKET_OPERATIONAL:
+            # SOP gate: an operational project needs a reported COD; nothing is estimated
             row[C_OP_ST] = row[C_FC_ST] = ST_NONE
             row[C_OP_EST] = row[C_OP_REP] = row[C_FC_EST] = row[C_FC_REP] = ""
-            op_estimated = fc_estimated = False
-            op_date = fc_date = None
+            fc_estimated, op_date, fc_date = False, None, None
+        elif fc_date:
+            op_date = estimate_op_from_fc(fc_date, cap, sector)
+            if bucket == BUCKET_CONSTR:
+                op_date = max(op_date, eom_add(PRESENT_DATE, _U.CONSTR_MIN_FUTURE_OP_MO))
+            row[C_OP_EST], row[C_OP_ST], op_estimated = fmt_db_date(op_date), ST_ESTIMATED, True
 
-    inv_m, metric = compute_investment(sector, bucket, cap)
-    if inv_m is not None:
-        row[C_INV_EST], row[C_INV_ST] = f"{inv_m:,.0f}", ST_ESTIMATED
+    inv_m, metric = _U.compute_investment(sector, bucket, cap, offon)
+    if inv_m is not None and not (bucket == BUCKET_OPERATIONAL and not repd_op):
+        row[C_INV_EST], row[C_INV_ST] = inv_m, ST_ESTIMATED
     else:
+        inv_m = None
         row[C_INV_ST] = ST_NONE
 
-    comment = build_comment(sector_phrase(sector, offon), inv_m is not None, inv_m, metric,
-                            fc_date, fc_estimated, op_date, op_estimated, is_operational)
+    comment = _U.build_comment(sector_phrase(sector, offon), inv_m is not None, inv_m, cap,
+                               fc_date, fc_estimated, op_date, op_estimated, is_operational)
     row[C_COMMENT], row[C_SHOWCOM] = (comment, "Yes") if comment.strip() else ("", "No")
     return row, bucket
 
@@ -715,9 +708,7 @@ def build_new_projects(db_ids: set[str], repd: pd.DataFrame) -> tuple[list[dict]
         row, bucket = build_row(rr, repd_idx, loc_cache)
         if SKIP_TERMINAL_NEW and bucket in TERMINAL_BUCKETS:
             continue
-        for col in (C_PSA, C_CFDAR):
-            row[col] = normalize_multiselect(row[col])
-        rows.append(row)
+        rows.append(finalize_row(row))
     return rows, stats
 
 

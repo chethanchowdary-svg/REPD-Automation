@@ -67,14 +67,22 @@ def fetch_repd_csv(gov_page_url: str = REPD_GOV_PAGE) -> tuple[str, pd.DataFrame
     return name, read_csv_bytes(dl.content)
 
 
-def read_csv_bytes(raw: bytes) -> pd.DataFrame:
-    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+def decode_mixed(raw: bytes) -> str:
+    """UTF-8 per line, cp1252 only for the lines that are not valid UTF-8. Decoding a whole file as
+    cp1252 because of one bad byte would garble every accented letter and dash in it."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    out = []
+    for line in raw.split(b"\n"):
         try:
-            return pd.read_csv(io.BytesIO(raw), dtype=str, keep_default_na=False, encoding=enc)
-        except (UnicodeDecodeError, UnicodeError):
-            continue
-    return pd.read_csv(io.BytesIO(raw), dtype=str, keep_default_na=False,
-                       encoding="utf-8", encoding_errors="replace")
+            out.append(line.decode("utf-8"))
+        except UnicodeDecodeError:
+            out.append(line.decode("cp1252", errors="replace"))
+    return "\n".join(out)
+
+
+def read_csv_bytes(raw: bytes) -> pd.DataFrame:
+    return pd.read_csv(io.StringIO(decode_mixed(raw)), dtype=str, keep_default_na=False)
 
 
 def read_csv_path(path) -> pd.DataFrame:
