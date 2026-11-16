@@ -1129,6 +1129,15 @@ def process_row(row, repd_idx, log, keep_lifecycle=False):
         row[C_FC_REP], row[C_FC_EST], row[C_FC_ST] = new_fc, "", ST_REPORTED
         fc_status = ST_REPORTED
 
+    # 3a. a reported FC (REPD "Under Construction") after the reported COD is wrong: remove it,
+    #     so step 4 estimates FC (e.g. operational: COD - MW/50 x 6)
+    fc_r, op_r = parse_db_date(row.get(C_FC_REP)), parse_db_date(row.get(C_OP_REP))
+    if fc_status == ST_REPORTED and op_status == ST_REPORTED and fc_r and op_r and fc_r > op_r:
+        row[C_FC_REP], row[C_FC_EST], row[C_FC_ST] = "", "", ""
+        fc_status = ""
+        changes.append(f"reported FC {fmt_db_date(fc_r)} after reported COD {fmt_db_date(op_r)}: "
+                       "removed, FC estimated")
+
     fc_reported = parse_db_date(row.get(C_FC_REP))
     op_reported = parse_db_date(row.get(C_OP_REP))
     is_operational = (work_bucket == BUCKET_OPERATIONAL
@@ -1454,6 +1463,10 @@ def finalize_row(row: dict) -> dict:
         d = parse_db_date(row.get(col))
         if d and d != end_of_month(d):
             row[col] = fmt_db_date(end_of_month(d))
+    # environmental approval date: removed when it is in the future or EIA approval = No
+    env = parse_db_date(row.get(C_ENVDATE))
+    if env and (env > PRESENT_DATE or (row.get(C_EIA) or "").strip() == "No"):
+        row[C_ENVDATE] = ""
     any_est = any((row.get(c) or "").strip() == ST_ESTIMATED for c in (C_INV_ST, C_FC_ST, C_OP_ST))
     row[C_SHOWCOM] = "Yes" if (any_est and not _blank(row.get(C_COMMENT))) else "No"
     return row

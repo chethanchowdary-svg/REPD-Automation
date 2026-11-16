@@ -61,6 +61,9 @@ Operational rows without a reported COD: nothing is estimated and their dates, i
 are kept exactly as in the DB. Duplicate REPD IDs / names and CfD capacity above project capacity are
 accepted as they are.
 
+Removed and re-done: an environmental approval date in the future or with EIA approval = No is cleared;
+a reported FC (REPD "Under Construction") later than the reported COD is removed and FC is estimated.
+
 **QC Flags tab**: what the rules cannot decide (broken characters, CfD in the PSA without a round,
 approval date in the future, COD before a reported FC in REPD, REPD capacity differences on Lead QC
 rows).

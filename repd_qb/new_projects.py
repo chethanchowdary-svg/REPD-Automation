@@ -608,6 +608,8 @@ def build_row(rrow, repd_idx, loc_cache=None):
 
     repd_op = parse_repd_date(rrow.get(R_OPDATE))
     repd_fc = parse_repd_date(rrow.get(R_UCONST))
+    if repd_fc and repd_op and repd_fc > repd_op:
+        repd_fc = None          # "Under Construction" after "Operational" in REPD: removed, FC estimated
 
     if sector == HYDRO_SECTOR:
         if repd_op:

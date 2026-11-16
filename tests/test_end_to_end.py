@@ -159,3 +159,29 @@ def test_operational_without_cod_kept_as_is():
     for c in ("Financial_close_(estimated)", "Operational_date_status", "Project_investment_($M)___Estimated",
               "Analyst_comments"):
         assert out[c] == row[c]
+
+
+def test_env_date_removed_when_future_or_eia_no():
+    out = _run_qc(_qc_row(Environmental_approval_date="12/16/2026", EIA_approval_received="Yes"))
+    assert out["Environmental_approval_date"] == ""
+    from repd_qb import updater
+    r = updater.finalize_row({"Sector": "Wind", "EIA_approval_received": "No",
+                              "Environmental_approval_date": "05/07/2020"})
+    assert r["Environmental_approval_date"] == ""
+
+
+def test_reported_fc_after_reported_cod_is_removed_and_estimated():
+    from repd_qb import updater
+    import datetime as dt
+    updater.PRESENT_DATE = dt.date(2026, 11, 16)
+    repd = pd.read_csv(FX / "repd.csv", dtype=str, keep_default_na=False)
+    idx = {r["Ref ID"]: r for _, r in repd.iterrows()}
+    fake = dict(repd.iloc[0])
+    fake.update({"Ref ID": "9998", "Development Status": "Operational", "Operational": "18/02/2016",
+                 "Under Construction": "01/05/2016"})
+    idx["9998"] = fake
+    row = _qc_row(State_data_plant_ID="9998", Project_life_cycle="Operational", Sector="Solar")
+    out = updater.finalize_row(updater.qc_process(dict(row), idx, []))
+    assert out["Financial_close_date_(reported)"] == ""
+    assert out["Financial_close_date_status"] == "Estimated"
+    assert updater.parse_db_date(out["Financial_close_(estimated)"]) < dt.date(2016, 2, 18)
