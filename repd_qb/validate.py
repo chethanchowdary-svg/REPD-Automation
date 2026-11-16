@@ -35,9 +35,6 @@ def row_flags(r, sheet, out, today):
         if m:
             i = m.start()
             _flag(out, sheet, r, "Broken character", f"{c}: ...{v[max(0, i - 30):i + 15]}... (retype the original letter)")
-    alloc = U.parse_capacity(r.get("UK_CFD_Allocated_Capacity_(MW)"))
-    if alloc and cap and alloc > cap + 0.01:
-        _flag(out, sheet, r, "CfD capacity > project capacity", f"{alloc:g} MW allocated vs {cap:g} MW")
     psa = U.multiselect_items(r.get(U.C_PSA))
     if U.PSA_CFD in psa and not U.normalize_multiselect(r.get(U.C_CFDAR)):
         _flag(out, sheet, r, "CfD without allocation round", "Power sales arrangement has CfD, AR blank")
@@ -46,19 +43,12 @@ def row_flags(r, sheet, out, today):
         _flag(out, sheet, r, "Environmental approval date in future", U.fmt_db_date(env))
     if env and (r.get(U.C_EIA) or "") == "No" and sheet != "New Projects":
         _flag(out, sheet, r, "Approval date but EIA = No", U.fmt_db_date(env))
-    if life == "Operational" and U._blank(r.get(U.C_OP_REP)):
-        _flag(out, sheet, r, "Operational without reported COD",
-              "SOP gate: find the achieved COD (no estimate allowed)")
     fc = U.parse_db_date(r.get(U.C_FC_REP)) or U.parse_db_date(r.get(U.C_FC_EST))
     op = U.parse_db_date(r.get(U.C_OP_REP)) or U.parse_db_date(r.get(U.C_OP_EST))
     if fc and op:
         gap = U.months_between(fc, op)
         if op < fc:
             _flag(out, sheet, r, "COD before FC", f"FC {U.fmt_db_date(fc)}, COD {U.fmt_db_date(op)}")
-        elif gap > U.OP_MAX_MONTHS and (r.get(U.C_OP_ST) or "") == U.ST_ESTIMATED:
-            _flag(out, sheet, r, "COD > 4 years after FC",
-                  f"reported FC {U.fmt_db_date(fc)}; COD must be in the future, so the 48-month cap "
-                  f"cannot be met (COD {U.fmt_db_date(op)}). Check for a reported COD.")
     if sector == U.BATTERY_SECTOR and (r.get(U.C_COLOC) or "") == "Potential Hybridization":
         _flag(out, sheet, r, "Battery co-located storage", "Potential Hybridization: use Yes or No (HR20)")
 
@@ -86,7 +76,6 @@ def duplicate_flags(rows, sheet, out):
 def build(upd: dict, new_rows: list, today) -> list[dict]:
     out = []
     full = upd.get("full", [])
-    duplicate_flags(full, "Full DB", out)
     qc_ids = {id(r) for r in upd.get("qc", [])}
     for r in full:
         row_flags(r, "Lead QC Update" if id(r) in qc_ids else "Full DB", out, today)

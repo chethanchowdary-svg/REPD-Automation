@@ -683,6 +683,8 @@ def _set_logged(row, col, val, changes, label=None):
 
 
 FIN_DEFAULT_BUCKETS = (BUCKET_CONSTR, BUCKET_OPERATIONAL, BUCKET_DECOMM)
+KEEP_AS_IS_COLS = (C_OP_ST, C_OP_EST, C_OP_REP, C_FC_ST, C_FC_EST, C_FC_REP,
+                   C_INV_ST, C_INV_EST, C_INV_REP, C_COMMENT, C_SHOWCOM)
 
 
 def apply_lifecycle_flags(row, work_bucket, changes, sector="", repd_bucket=None):
@@ -843,6 +845,9 @@ def validate_and_fix_dates(row, cap, sector, work_bucket, rrow, changes):
                 new_op = estimate_op_from_fc(fc_date, cap, sector, per_50=CONSTRUCTION_OP_PER_50)
             else:
                 new_op = estimate_op_from_fc(fc_date, cap, sector)
+            if new_op and new_op <= PRESENT_DATE:
+                # e.g. Ready-to-build with a past reported FC: COD still has to be in the future
+                new_op = eom_add(PRESENT_DATE, min_build_months(sector))
             if new_op and new_op > PRESENT_DATE:
                 row[C_OP_EST] = fmt_db_date(new_op)
                 row[C_OP_ST] = ST_ESTIMATED
@@ -878,10 +883,11 @@ def validate_and_fix_dates(row, cap, sector, work_bucket, rrow, changes):
                 row[C_OP_REP] = ""
                 row[C_OP_ST] = ST_NONE
 
-    # Rule C: FC must not be in the past for Early/Late
+    # Rule C: an ESTIMATED FC must not be in the past for Early/Late (a reported FC, e.g. on a
+    # Ready-to-build row, is kept)
     if work_bucket in (BUCKET_EARLY, BUCKET_LATE):
         fc_date, fc_rep, op_date, op_rep = _read()
-        if fc_date and fc_date <= PRESENT_DATE:
+        if fc_date and fc_date <= PRESENT_DATE and not fc_rep:
             _clear_fc_and_reestimate(f"DATE CHECK Rule C: FC ({fmt_db_date(fc_date)}) in the past for "
                                      f"{BUCKET_TO_DB_LABEL.get(work_bucket, '')}")
             fc_date, fc_rep, op_date, op_rep = _read()
@@ -998,6 +1004,7 @@ def process_row(row, repd_idx, log, keep_lifecycle=False):
     """keep_lifecycle=True (Lead QC rows where REPD would move the lifecycle down): the DB
     lifecycle is kept, but every other rule still runs."""
     changes, tracked_cols = [], set()
+    orig = dict(row)
     name = row.get(C_NAME, "")
     join_raw = "" if _blank(row.get(C_JOIN)) else str(row.get(C_JOIN)).strip()
     rid = match_repd_id(join_raw, repd_idx)
@@ -1066,9 +1073,11 @@ def process_row(row, repd_idx, log, keep_lifecycle=False):
     work_bucket = DB_LABEL_TO_BUCKET.get(cur_label, bucket)
 
     # 1b. lifecycle flags + Show SPV
-    # 1a. house rules section 10: a reported financial close that has passed -> In construction
+    # 1a. house rules section 10: a reported financial close that has passed -> In construction.
+    # Ready-to-build rows are kept as they are (team decision).
     fc_rep_now = parse_db_date(row.get(C_FC_REP)) or parse_repd_date(rrow.get(R_UCONST))
-    if (work_bucket in (BUCKET_EARLY, BUCKET_LATE) and fc_rep_now and fc_rep_now <= PRESENT_DATE
+    if (work_bucket in (BUCKET_EARLY, BUCKET_LATE) and cur_label != "ready-to-build"
+            and fc_rep_now and fc_rep_now <= PRESENT_DATE
             and (row.get(C_FC_ST) or "").strip() == ST_REPORTED):
         _set_logged(row, C_LIFE, "In construction", changes,
                     label=f"life cycle (HR10: reported FC {fmt_db_date(fc_rep_now)} has passed)")
@@ -1145,13 +1154,14 @@ def process_row(row, repd_idx, log, keep_lifecycle=False):
     if (row.get(C_ENVDATE) or "").strip() != env_before:
         tracked_cols.add(C_ENVDATE)
 
-    # 3d. operational without reported OP date -> no estimates
+    # 3d. operational without reported OP date -> nothing estimated, dates / investment / comment
+    # kept exactly as they are in the DB (team decision)
     if work_bucket == BUCKET_OPERATIONAL and op_reported is None:
-        row[C_OP_ST] = row[C_FC_ST] = row[C_INV_ST] = ST_NONE
-        row[C_OP_EST] = row[C_OP_REP] = row[C_FC_EST] = row[C_FC_REP] = ""
-        row[C_INV_EST] = row[C_INV_REP] = ""
-        row[C_COMMENT], row[C_SHOWCOM] = "", "No"
-        changes.append("operational w/o reported OP date -> no estimates (dates + investment)")
+        for c in KEEP_AS_IS_COLS:
+            if c in orig:
+                row[c] = orig[c]
+        tracked_cols.add("__KEEP_AS_IS__")
+        changes.append("operational w/o reported OP date -> dates, investment and comment kept as is")
         log.append({"Project name": name, "State data plant ID": rid,
                     "Action": "UPDATED" if changes else "no change", "Detail": " | ".join(changes)})
         return row, bool(changes), tracked_cols
@@ -1337,6 +1347,8 @@ def qc_process(row: dict, repd_idx: dict, log: list) -> dict:
     if "__NO_MATCH__" in tracked:
         return original
     new_row[C_CAP] = original.get(C_CAP, "")
+    if "__KEEP_AS_IS__" in tracked:
+        return new_row
     cap = parse_capacity(new_row.get(C_CAP))
     sector = (new_row.get(C_SECTOR) or "").strip()
     offon = new_row.get(C_OFFON)

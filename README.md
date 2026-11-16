@@ -49,17 +49,21 @@ Schedule: 06:00 UTC on 10 Jan / Apr / Jul / Oct. Edit the `cron` line to change 
 
 | Area | Rule |
 |---|---|
-| Dates (HR6) | Early FC = today + MW/50x8 (>= 6 mo); Late FC = today + MW/50x6 (>= 3 mo); In-construction FC = today - MW/50x6 (not after today); COD = FC + MW/50x6 (wind >= 6, others >= 3, <= 48 mo); operational FC = COD - MW/50x6 (<= 36 mo); estimates at month-end; reported dates are never overwritten by the gap checks |
-| Lifecycle (HR10, SOP 6) | reported FC passed on a pre-construction row -> In construction; Late-stage with EIA = No and Grid = No -> Early-stage; Late / Ready-to-build approvals, financing and PPA are kept (researched), defaults only where the SOP fixes them |
+| Dates (HR6) | Early FC = today + MW/50x8 (>= 6 mo); Late FC = today + MW/50x6 (>= 3 mo); In-construction FC = today - MW/50x6 (not after today); COD = FC + MW/50x6 (wind >= 6, others >= 3, <= 48 mo; an in-construction COD may go past 48 mo so it stays in the future); operational FC = COD - MW/50x6 (<= 36 mo); estimates at month-end; reported dates are never overwritten by the gap checks |
+| Lifecycle (HR10, SOP 6) | reported FC passed on an Early/Late-stage row -> In construction (Ready-to-build rows are kept as they are, with their reported FC); Late-stage with EIA = No and Grid = No -> Early-stage; Late / Ready-to-build approvals, financing and PPA are kept (researched), defaults only where the SOP fixes them |
 | Investment (HR7) | nearest $1M (BESS 1 decimal); comment metric = value / MW |
 | Comments (HR8) | template cases 2-5, "onshore/offshore wind", Show analyst comment = Yes only when something is estimated |
 | Battery (HR2, HR20) | name gets " BESS"; Power sales arrangement = Not Applicable; Revenue mechanism defaults to Yet to be determined/Unavailable (New Projects now has the column) |
 | Commercial (SOP 7) | blank PSA -> Yet to be determined/Unavailable (no longer cleared when PPA = No); CfD round adds CfD to the PSA list; Financing type Debt + Equity from construction on, other instruments kept |
 | Formats (HR14) | Yes/No instead of True/False; multi-selects as `A;B`; mojibake repaired, accents -> plain letters |
 
-**QC Flags tab**: what the rules cannot decide (duplicate REPD IDs / names, CfD capacity > project
-capacity, broken characters, operational without a reported COD, COD > 4 years after a reported FC,
-REPD capacity differences on Lead QC rows, ...).
+Operational rows without a reported COD: nothing is estimated and their dates, investment and comment
+are kept exactly as in the DB. Duplicate REPD IDs / names and CfD capacity above project capacity are
+accepted as they are.
+
+**QC Flags tab**: what the rules cannot decide (broken characters, CfD in the PSA without a round,
+approval date in the future, COD before a reported FC in REPD, REPD capacity differences on Lead QC
+rows).
 
 ## GPT matching (new REPD projects vs DB projects without a Ref ID)
 

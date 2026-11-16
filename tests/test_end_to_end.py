@@ -126,3 +126,36 @@ def test_mojibake_repaired_then_plain():
     assert plain_letters("UK\u00c3\u00a2\u00e2\u201a\u00ac\u00e2\u201e\u00a2s") == "UK's"
     assert plain_letters("\u00a313.2 billion") == "\u00a313.2 billion"
     assert plain_letters("Orkney\u00ef\u00bf\u00bds") == "Orkney\ufffds"          # left for QC Flags
+
+
+def test_rtb_with_past_reported_fc_is_kept():
+    out = _run_qc(_qc_row(Project_life_cycle="Ready-to-build", EIA_approval_received="Yes",
+                          Grid_connection_approved="Yes", Financing_secured="Yes - Partial",
+                          **{"Financial_close_date_status": "Reported",
+                             "Financial_close_date_(reported)": "09/30/2026",
+                             "Operational_date_status": "Estimated", "Operational_date_(estimated)": "10/31/2026"}))
+    from repd_qb import updater
+    assert out["Project_life_cycle"] == "Ready-to-build"
+    assert out["Financial_close_date_(reported)"] == "09/30/2026"
+    assert updater.parse_db_date(out["Operational_date_(estimated)"]) > updater.PRESENT_DATE
+
+
+def test_operational_without_cod_kept_as_is():
+    from repd_qb import updater
+    import datetime as dt
+    updater.PRESENT_DATE = dt.date(2026, 11, 16)
+    repd = pd.read_csv(FX / "repd.csv", dtype=str, keep_default_na=False)
+    idx = {r["Ref ID"]: r for _, r in repd.iterrows()}
+    fake = dict(repd.iloc[0])
+    fake.update({"Ref ID": "9999", "Development Status": "Operational", "Operational": "", "Under Construction": ""})
+    idx["9999"] = fake
+    rid = "9999"
+    row = _qc_row(State_data_plant_ID=rid, Project_life_cycle="Operational",
+                  **{"Financial_close_date_status": "Estimated", "Financial_close_(estimated)": "06/30/2020",
+                     "Operational_date_status": "Not reported, need more data to estimate",
+                     "Project_investment_status": "Estimated", "Project_investment_($M)___Estimated": "50",
+                     "Analyst_comments": "keep me"})
+    out = updater.qc_process(dict(row), idx, [])
+    for c in ("Financial_close_(estimated)", "Operational_date_status", "Project_investment_($M)___Estimated",
+              "Analyst_comments"):
+        assert out[c] == row[c]
