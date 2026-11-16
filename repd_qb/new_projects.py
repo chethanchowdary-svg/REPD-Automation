@@ -608,6 +608,10 @@ def build_row(rrow, repd_idx, loc_cache=None):
 
     repd_op = parse_repd_date(rrow.get(R_OPDATE))
     repd_fc = parse_repd_date(rrow.get(R_UCONST))
+    if (rrow.get("Development Status (short)") or "").strip().lower() == "awaiting construction":
+        # planned dates that have passed are ignored; Late-stage estimates push them forward
+        repd_op = repd_op if repd_op and repd_op > PRESENT_DATE else None
+        repd_fc = repd_fc if repd_fc and repd_fc > PRESENT_DATE else None
     if repd_fc and repd_op and repd_fc > repd_op:
         repd_fc = None          # "Under Construction" after "Operational" in REPD: removed, FC estimated
 

@@ -61,6 +61,10 @@ Operational rows without a reported COD: nothing is estimated and their dates, i
 are kept exactly as in the DB. Duplicate REPD IDs / names and CfD capacity above project capacity are
 accepted as they are.
 
+REPD "Awaiting Construction" (short status): stays Late-stage even when its planned date has passed;
+passed REPD Under Construction / Operational dates and a passed reported FC are dropped and FC / COD are
+estimated forward.
+
 Removed and re-done: an environmental approval date in the future or with EIA approval = No is cleared;
 a reported FC (REPD "Under Construction") later than the reported COD is removed and FC is estimated.
 

@@ -127,6 +127,13 @@ R_APPEAL_GRANTED = "Appeal Granted"
 R_XCOORD   = "X-coordinate"
 R_YCOORD   = "Y-coordinate"
 R_CAP      = "Installed Capacity (MWelec)"
+R_STATUS_SHORT = "Development Status (short)"
+
+
+def repd_awaiting_construction(rrow):
+    """REPD short status 'Awaiting Construction': permission granted, construction not started.
+    Its Under Construction / Operational dates are only plans."""
+    return (str(rrow.get(R_STATUS_SHORT) or "").strip().lower() == "awaiting construction")
 
 DATE_COLS = [C_OP_EST, C_OP_REP, C_FC_EST, C_FC_REP, C_ENVDATE]
 
@@ -1076,7 +1083,8 @@ def process_row(row, repd_idx, log, keep_lifecycle=False):
     # 1a. house rules section 10: a reported financial close that has passed -> In construction.
     # Ready-to-build rows are kept as they are (team decision).
     fc_rep_now = parse_db_date(row.get(C_FC_REP)) or parse_repd_date(rrow.get(R_UCONST))
-    if (work_bucket in (BUCKET_EARLY, BUCKET_LATE) and cur_label != "ready-to-build"
+    awaiting = repd_awaiting_construction(rrow)
+    if (work_bucket in (BUCKET_EARLY, BUCKET_LATE) and cur_label != "ready-to-build" and not awaiting
             and fc_rep_now and fc_rep_now <= PRESENT_DATE
             and (row.get(C_FC_ST) or "").strip() == ST_REPORTED):
         _set_logged(row, C_LIFE, "In construction", changes,
@@ -1114,6 +1122,10 @@ def process_row(row, repd_idx, log, keep_lifecycle=False):
     repd_fc = parse_repd_date(rrow.get(R_UCONST))
     op_status = (row.get(C_OP_ST) or "").strip()
     fc_status = (row.get(C_FC_ST) or "").strip()
+    if awaiting:
+        # planned dates that have passed are not events: ignored, estimated forward instead
+        repd_op = repd_op if repd_op and repd_op > PRESENT_DATE else None
+        repd_fc = repd_fc if repd_fc and repd_fc > PRESENT_DATE else None
     inv_status = (row.get(C_INV_ST) or "").strip()
 
     if repd_op is not None:
@@ -1137,6 +1149,15 @@ def process_row(row, repd_idx, log, keep_lifecycle=False):
         fc_status = ""
         changes.append(f"reported FC {fmt_db_date(fc_r)} after reported COD {fmt_db_date(op_r)}: "
                        "removed, FC estimated")
+
+    # 3b. Awaiting Construction (kept Late-stage): a passed reported FC is pushed forward
+    if awaiting and work_bucket == BUCKET_LATE and cur_label != "ready-to-build":
+        fc_r = parse_db_date(row.get(C_FC_REP))
+        if fc_status == ST_REPORTED and fc_r and fc_r <= PRESENT_DATE:
+            row[C_FC_REP], row[C_FC_EST], row[C_FC_ST] = "", "", ""
+            fc_status = ""
+            changes.append(f"REPD Awaiting Construction: passed FC {fmt_db_date(fc_r)} removed, "
+                           "FC estimated forward")
 
     fc_reported = parse_db_date(row.get(C_FC_REP))
     op_reported = parse_db_date(row.get(C_OP_REP))

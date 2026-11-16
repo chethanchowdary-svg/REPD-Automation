@@ -185,3 +185,28 @@ def test_reported_fc_after_reported_cod_is_removed_and_estimated():
     assert out["Financial_close_date_(reported)"] == ""
     assert out["Financial_close_date_status"] == "Estimated"
     assert updater.parse_db_date(out["Financial_close_(estimated)"]) < dt.date(2016, 2, 18)
+
+
+def test_awaiting_construction_stays_late_stage_with_dates_pushed_forward():
+    from repd_qb import updater
+    import datetime as dt
+    updater.PRESENT_DATE = dt.date(2026, 11, 16)
+    repd = pd.read_csv(FX / "repd.csv", dtype=str, keep_default_na=False)
+    idx = {r["Ref ID"]: r for _, r in repd.iterrows()}
+    fake = dict(repd.iloc[0])
+    fake.update({"Ref ID": "9997", "Development Status": "Planning Permission Granted",
+                 "Development Status (short)": "Awaiting Construction",
+                 "Under Construction": "01/03/2025", "Operational": "01/06/2026"})
+    idx["9997"] = fake
+    row = _qc_row(State_data_plant_ID="9997", Project_life_cycle="Late-stage", Lead_QC="false",
+                  EIA_approval_received="Yes",
+                  **{"Financial_close_date_status": "Reported", "Financial_close_date_(reported)": "03/01/2025"})
+    log = []
+    out, _c, _t = updater.process_row(dict(row), idx, log)
+    out = updater.finalize_row(out)
+    assert out["Project_life_cycle"] == "Late-stage"
+    fc = updater.parse_db_date(out["Financial_close_(estimated)"])
+    op = updater.parse_db_date(out["Operational_date_(estimated)"])
+    assert out["Financial_close_date_status"] == "Estimated" and fc > updater.PRESENT_DATE
+    assert out["Operational_date_status"] == "Estimated" and op > fc
+    assert out["Financial_close_date_(reported)"] == "" and out["Operational_date_(reported)"] == ""
